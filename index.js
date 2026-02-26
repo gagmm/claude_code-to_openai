@@ -1,6 +1,6 @@
 // ================================================================
-// Claude API 代理 v3.0
-// 自定义Token鉴权 / Telegram Bot管理 / 多Key负载均衡 / 自动刷新
+// Claude API 代理 v3.1 (修复版)
+// 功能：自定义Token鉴权 / Telegram Bot管理 / 多Key负载均衡 / 自动刷新 / 详细调试
 // ================================================================
 
 const pendingRefreshes = new Map();
@@ -116,11 +116,16 @@ async function sendTGLong(env, message) {
 // ================================================================
 
 async function saveKey(env, label, data) {
-    if (!env.TOKEN_STORE) return;
+    if (!env.TOKEN_STORE) {
+        console.error("[KV] TOKEN_STORE not bound! Check wrangler.toml or Dashboard bindings.");
+        return false;
+    }
     try {
         await env.TOKEN_STORE.put("key:" + label, JSON.stringify(data));
+        return true;
     } catch (e) {
         console.error("[KV Save]", e.message);
+        return false;
     }
 }
 
@@ -187,7 +192,7 @@ async function incrementGlobalStats(env) {
 }
 
 // ================================================================
-// Token 刷新
+// Token 刷新 (增强版调试)
 // ================================================================
 
 async function refreshTokenWithLock(refreshToken) {
@@ -205,33 +210,59 @@ async function refreshTokenWithLock(refreshToken) {
 
 async function performTokenRefresh(refreshToken) {
     try {
+        // 构造请求体
+        var body = JSON.stringify({
+            grant_type: "refresh_token",
+            refresh_token: refreshToken,
+            client_id: "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+        });
+
+        console.log("[Refresh] Sending request to Anthropic...");
+
         var resp = await fetch("https://console.anthropic.com/v1/oauth/token", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-                grant_type: "refresh_token",
-                refresh_token: refreshToken,
-                client_id: "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-            })
+            body: body
         });
+
+        var respText = await resp.text();
+        console.log("[Refresh] Status:", resp.status);
+
         if (!resp.ok) {
-            var errText = await resp.text().catch(function() { return ""; });
-            console.error("[Refresh] HTTP " + resp.status + ": " + errText);
-            return null;
+            console.error("[Refresh] HTTP Error:", resp.status, respText);
+            return { error_detail: "HTTP " + resp.status + ": " + respText };
         }
-        return await resp.json();
+
+        try {
+            return JSON.parse(respText);
+        } catch (e) {
+            console.error("[Refresh] JSON Parse Error:", e.message, respText);
+            return { error_detail: "Invalid JSON: " + respText.substring(0, 100) };
+        }
     } catch (err) {
-        console.error("[Refresh] Error:", err.message);
-        return null;
+        console.error("[Refresh] Network Error:", err.message);
+        return { error_detail: "Network error: " + err.message };
     }
 }
 
 async function refreshSingleKey(env, keyData) {
     var now = Date.now();
     var refreshed = await refreshTokenWithLock(keyData.refreshToken);
-    if (!refreshed || !refreshed.access_token) {
-        return { success: false, error: "Refresh API returned no token" };
+
+    // 检查是否有详细错误信息
+    if (!refreshed) {
+        return { success: false, error: "Refresh returned null (Network issue?)" };
     }
+
+    if (refreshed.error_detail) {
+        return { success: false, error: refreshed.error_detail };
+    }
+
+    if (!refreshed.access_token) {
+        var debugInfo = JSON.stringify(refreshed).substring(0, 200);
+        return { success: false, error: "No access_token in response. Body: " + debugInfo };
+    }
+
     var newExpiresAt = now + ((refreshed.expires_in || 3600) * 1000);
     var expireStr = new Date(newExpiresAt).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" });
 
@@ -239,7 +270,11 @@ async function refreshSingleKey(env, keyData) {
     keyData.refreshToken = refreshed.refresh_token || keyData.refreshToken;
     keyData.expiresAt = newExpiresAt;
     keyData.lastRefreshed = new Date().toISOString();
-    await saveKey(env, keyData.label, keyData);
+    
+    var saved = await saveKey(env, keyData.label, keyData);
+    if (!saved) {
+        return { success: false, error: "KV Save failed after refresh" };
+    }
 
     return { success: true, newToken: refreshed.access_token, expireStr: expireStr };
 }
@@ -528,26 +563,27 @@ async function handleTelegramWebhook(request, env) {
                     await sendTG(env, "⚠️ 格式：/addkey &lt;label&gt; &lt;JSON配置&gt;");
                     break;
                 }
-                var label = args[0];
-                var jsonStr = args.slice(1).join(" ");
-                var parsed;
-                try { parsed = JSON.parse(jsonStr); } catch (e) {
+                var addLabel = args[0];
+                var addJsonStr = args.slice(1).join(" ");
+                var addParsed;
+                try { addParsed = JSON.parse(addJsonStr); } catch (e) {
                     await sendTG(env, "❌ JSON 解析失败：" + escHtml(e.message));
                     break;
                 }
-                var oauth = parsed.claudeAiOauth;
-                if (!oauth || !oauth.accessToken || !oauth.refreshToken) {
+                var addOauth = addParsed.claudeAiOauth;
+                if (!addOauth || !addOauth.accessToken || !addOauth.refreshToken) {
                     await sendTG(env, "❌ 缺少 accessToken 或 refreshToken");
                     break;
                 }
-                var keyData = {
-                    label: label,
-                    accessToken: oauth.accessToken,
-                    refreshToken: oauth.refreshToken,
-                    expiresAt: oauth.expiresAt || 0,
-                    scopes: oauth.scopes || [],
-                    subscriptionType: oauth.subscriptionType || "unknown",
-                    rateLimitTier: oauth.rateLimitTier || "default",
+
+                var addKeyData = {
+                    label: addLabel,
+                    accessToken: addOauth.accessToken,
+                    refreshToken: addOauth.refreshToken,
+                    expiresAt: addOauth.expiresAt || 0,
+                    scopes: addOauth.scopes || [],
+                    subscriptionType: addOauth.subscriptionType || "unknown",
+                    rateLimitTier: addOauth.rateLimitTier || "default",
                     enabled: true,
                     addedAt: new Date().toISOString(),
                     addedBy: msg.from ? (msg.from.first_name || "") + " (" + msg.from.id + ")" : "unknown",
@@ -556,15 +592,70 @@ async function handleTelegramWebhook(request, env) {
                     useCount: 0,
                     errorCount: 0,
                 };
-                await saveKey(env, label, keyData);
-                var expStr = keyData.expiresAt ? new Date(keyData.expiresAt).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" }) : "未知";
+
+                // 保存到 KV
+                var addSaved = await saveKey(env, addLabel, addKeyData);
+                if (!addSaved) {
+                    await sendTG(env, "❌ 保存失败！请检查 KV (TOKEN_STORE) 是否已绑定");
+                    break;
+                }
+
+                // 验证是否真的存入了
+                var addVerify = await getKey(env, addLabel);
+                if (!addVerify) {
+                    await sendTG(env, "❌ 保存后验证失败！KV 可能未正确绑定");
+                    break;
+                }
+
+                var addNow = Date.now();
+                var addExpStr = addKeyData.expiresAt
+                    ? new Date(addKeyData.expiresAt).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" })
+                    : "未知";
+                var addRemainMin = addKeyData.expiresAt ? Math.round((addKeyData.expiresAt - addNow) / 60000) : 0;
+
                 await sendTG(env,
-                    "✅ <b>Key 添加成功</b>\n\n" +
-                    "📛 Label: <code>" + escHtml(label) + "</code>\n" +
-                    "📋 订阅: " + escHtml(keyData.subscriptionType) + "\n" +
-                    "⏰ 到期: " + expStr + "\n" +
-                    "🔑 Token: <code>" + oauth.accessToken.substring(0, 25) + "...</code>"
+                    "✅ <b>Key 已保存</b>\n\n" +
+                    "📛 Label: <code>" + escHtml(addLabel) + "</code>\n" +
+                    "📋 订阅: " + escHtml(addKeyData.subscriptionType) + "\n" +
+                    "⏰ 到期: " + addExpStr + " (" + addRemainMin + "分钟)\n" +
+                    "🔑 Token: <code>" + addOauth.accessToken.substring(0, 25) + "...</code>"
                 );
+
+                // 如果已过期或即将过期（10分钟内），立即刷新
+                if (!addKeyData.expiresAt || addKeyData.expiresAt < addNow + 10 * 60 * 1000) {
+                    await sendTG(env, "🔄 Token 已过期或即将过期，正在自动刷新...");
+                    var addRefreshResult = await refreshSingleKey(env, addKeyData);
+                    if (addRefreshResult.success) {
+                        // 刷新后重新读取最新数据构建完整配置
+                        var addRefreshedKey = await getKey(env, addLabel);
+                        var addFullConfig = {
+                            claudeAiOauth: {
+                                accessToken: addRefreshedKey.accessToken,
+                                refreshToken: addRefreshedKey.refreshToken,
+                                expiresAt: addRefreshedKey.expiresAt,
+                                scopes: addRefreshedKey.scopes || [],
+                                subscriptionType: addRefreshedKey.subscriptionType || "unknown",
+                                rateLimitTier: addRefreshedKey.rateLimitTier || "default",
+                            }
+                        };
+                        await sendTGLong(env,
+                            "✅ <b>刷新成功！Key 已可用</b>\n\n" +
+                            "📛 Label: <b>" + escHtml(addLabel) + "</b>\n" +
+                            "⏰ 新到期: " + addRefreshResult.expireStr + "\n\n" +
+                            "<b>最新配置（备份）：</b>\n" +
+                            "<pre>" + escHtml(JSON.stringify(addFullConfig, null, 2)) + "</pre>"
+                        );
+                    } else {
+                        await sendTG(env,
+                            "⚠️ <b>自动刷新失败</b>\n\n" +
+                            "原因: " + escHtml(addRefreshResult.error) + "\n" +
+                            "Key 已保存但可能无法使用，请检查 refreshToken 是否有效\n" +
+                            "可以稍后用 /refresh " + escHtml(addLabel) + " 重试"
+                        );
+                    }
+                } else {
+                    await sendTG(env, "✅ Token 仍在有效期内，已加入负载均衡池");
+                }
                 break;
 
             case "/removekey":
@@ -614,12 +705,41 @@ async function handleTelegramWebhook(request, env) {
                 if (args.length < 1) { await sendTG(env, "⚠️ 格式：/refresh &lt;label&gt;"); break; }
                 var rKey = await getKey(env, args[0]);
                 if (!rKey) { await sendTG(env, "❌ 未找到: " + escHtml(args[0])); break; }
-                await sendTG(env, "🔄 正在刷新 " + escHtml(args[0]) + "...");
+                await sendTG(env,
+                    "🔄 正在刷新 <b>" + escHtml(args[0]) + "</b>...\n" +
+                    "RefreshToken: <code>" + rKey.refreshToken.substring(0, 25) + "...</code>"
+                );
                 var rResult = await refreshSingleKey(env, rKey);
                 if (rResult.success) {
-                    await sendTG(env, "✅ 刷新成功\n⏰ 新到期: " + rResult.expireStr);
+                    var rRefreshedKey = await getKey(env, args[0]);
+                    var rFullConfig = {
+                        claudeAiOauth: {
+                            accessToken: rRefreshedKey.accessToken,
+                            refreshToken: rRefreshedKey.refreshToken,
+                            expiresAt: rRefreshedKey.expiresAt,
+                            scopes: rRefreshedKey.scopes || [],
+                            subscriptionType: rRefreshedKey.subscriptionType || "unknown",
+                            rateLimitTier: rRefreshedKey.rateLimitTier || "default",
+                        }
+                    };
+                    await sendTGLong(env,
+                        "✅ <b>刷新成功</b>\n\n" +
+                        "📛 " + escHtml(args[0]) + "\n" +
+                        "⏰ 新到期: " + rResult.expireStr + "\n\n" +
+                        "<b>最新配置：</b>\n" +
+                        "<pre>" + escHtml(JSON.stringify(rFullConfig, null, 2)) + "</pre>"
+                    );
                 } else {
-                    await sendTG(env, "❌ 刷新失败: " + escHtml(rResult.error));
+                    await sendTG(env,
+                        "❌ <b>刷新失败</b>\n\n" +
+                        "📛 " + escHtml(args[0]) + "\n" +
+                        "<b>错误信息：</b>\n" +
+                        "<pre>" + escHtml(rResult.error) + "</pre>\n\n" +
+                        "<b>可能原因：</b>\n" +
+                        "1. refreshToken 已失效\n" +
+                        "2. Anthropic 服务限制\n" +
+                        "3. 网络问题"
+                    );
                 }
                 break;
 
@@ -1042,8 +1162,8 @@ export default {
             }
             if (url.pathname === "/debug/version") {
                 return corsResponse(JSON.stringify({
-                    version: "3.0-loadbalance",
-                    features: ["custom-token-auth", "telegram-bot", "multi-key-lb", "auto-refresh"],
+                    version: "3.1-loadbalance-debug",
+                    features: ["custom-token-auth", "telegram-bot", "multi-key-lb", "auto-refresh", "detail-errors"],
                     models: Object.keys(MODEL_MAP)
                 }));
             }
