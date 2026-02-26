@@ -1,6 +1,6 @@
 // ================================================================
 // Claude API 代理 v3.0
-// 功能：自定义Token鉴权 / Telegram Bot管理 / 多Key负载均衡 / 自动刷新
+// 自定义Token鉴权 / Telegram Bot管理 / 多Key负载均衡 / 自动刷新
 // ================================================================
 
 const pendingRefreshes = new Map();
@@ -18,526 +18,118 @@ const MODEL_MAP = {
     "claude-3-opus-20240229": "claude-3-opus-20240229",
 };
 
-const SUPPORTED_MODELS = Object.keys(MODEL_MAP).map(id => ({
-    id, object: "model", created: 0, owned_by: "anthropic"
-}));
+const SUPPORTED_MODELS = Object.keys(MODEL_MAP).map(function(id) {
+    return { id: id, object: "model", created: 0, owned_by: "anthropic" };
+});
 
 // ================================================================
-// 入口
+// 工具函数（必须在最前面定义）
 // ================================================================
-export default {
-    async fetch(request, env, ctx) {
-        if (request.method === "OPTIONS") {
-            return corsResponse(null, 204);
+
+function corsResponse(body, status) {
+    if (status === undefined) status = 200;
+    return new Response(body, {
+        status: status,
+        headers: {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
         }
+    });
+}
 
-        const url = new URL(request.url);
+function escHtml(text) {
+    if (!text) return "";
+    return String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
 
-        try {
-            // Telegram Webhook
-            if (url.pathname === "/telegram/webhook" && request.method === "POST") {
-                return await handleTelegramWebhook(request, env);
-            }
+function sleep(ms) {
+    return new Promise(function(resolve) { setTimeout(resolve, ms); });
+}
 
-            // API 路由
-            if (url.pathname === "/v1/chat/completions" && request.method === "POST") {
-                return await handleChatCompletions(request, env);
-            }
-
-            if (url.pathname === "/v1/models" && request.method === "GET") {
-                return corsResponse(JSON.stringify({ object: "list", data: SUPPORTED_MODELS }));
-            }
-
-            // 管理路由
-            if (url.pathname.startsWith("/admin/")) {
-                return await handleAdmin(url, request, env);
-            }
-
-            // 设置 Telegram Webhook 的便捷端点
-            if (url.pathname === "/setup-webhook" && request.method === "GET") {
-                return await setupTelegramWebhook(url, env);
-            }
-
-            if (url.pathname === "/debug/version") {
-                return corsResponse(JSON.stringify({
-                    version: "3.0-loadbalance",
-                    features: [
-                        "custom-token-auth",
-                        "telegram-bot-management",
-                        "multi-key-load-balance",
-                        "auto-refresh",
-                        "kv-persistent-storage"
-                    ],
-                    models: Object.keys(MODEL_MAP)
-                }));
-            }
-
-            return corsResponse(JSON.stringify({ error: "Not Found" }), 404);
-        } catch (err) {
-            console.error("[Global Error]", err.message, err.stack);
-            return corsResponse(JSON.stringify({ error: "Internal Server Error" }), 500);
-        }
-    },
-
-    // 定时任务
-    async scheduled(event, env, ctx) {
-        console.log("[Cron] Token check at", new Date().toISOString());
-        ctx.waitUntil(checkAndRefreshAllKeys(env));
-    }
-};
+function mapStopReason(r) {
+    var map = {
+        "end_turn": "stop",
+        "stop_sequence": "stop",
+        "max_tokens": "length",
+        "tool_use": "tool_calls"
+    };
+    return map[r] || "stop";
+}
 
 // ================================================================
-// 鉴权：验证自定义 Token
+// Telegram 发送函数
 // ================================================================
-function validateCustomToken(authHeader, env) {
-    const token = authHeader.replace(/^Bearer\s+/i, "").trim();
-    if (!token) return false;
 
-    const allowedTokens = (env.CUSTOM_TOKENS || "").split(",").map(t => t.trim()).filter(Boolean);
-
-    // 如果没配置自定义 token，拒绝所有请求
-    if (allowedTokens.length === 0) {
-        console.warn("[Auth] No CUSTOM_TOKENS configured, rejecting all requests");
+async function sendTG(env, message) {
+    var botToken = env.TELEGRAM_BOT_TOKEN;
+    var chatId = env.TELEGRAM_CHAT_ID;
+    if (!botToken || !chatId) {
+        console.warn("[TG] Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID");
         return false;
     }
-
-    return allowedTokens.includes(token);
-}
-
-// ================================================================
-// Telegram Bot 命令处理
-// ================================================================
-async function setupTelegramWebhook(url, env) {
-    const botToken = env.TELEGRAM_BOT_TOKEN;
-    if (!botToken) {
-        return corsResponse(JSON.stringify({ error: "TELEGRAM_BOT_TOKEN not set" }), 500);
-    }
-
-    const webhookUrl = `${url.origin}/telegram/webhook`;
-    const resp = await fetch(`https://api.telegram.org/bot${botToken}/setWebhook`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url: webhookUrl })
-    });
-    const result = await resp.json();
-    return corsResponse(JSON.stringify({ webhook_url: webhookUrl, telegram_response: result }));
-}
-
-async function handleTelegramWebhook(request, env) {
-    const update = await request.json().catch(() => null);
-    if (!update || !update.message) {
-        return new Response("OK");
-    }
-
-    const msg = update.message;
-    const chatId = String(msg.chat.id);
-    const allowedChatId = String(env.TELEGRAM_CHAT_ID || "");
-    const text = (msg.text || "").trim();
-
-    // 只处理指定群组/用户的消息
-    if (chatId !== allowedChatId) {
-        console.log(`[TG] Ignored message from chat ${chatId}, expected ${allowedChatId}`);
-        return new Response("OK");
-    }
-
-    // 命令路由
-    if (text.startsWith("/")) {
-        const parts = text.split(/\s+/);
-        const cmd = parts[0].toLowerCase().split("@")[0]; // 去掉 @botname
-        const args = parts.slice(1);
-
-        try {
-            switch (cmd) {
-                case "/help":
-                    await handleHelp(env);
-                    break;
-                case "/addkey":
-                    await handleAddKey(args, msg, env);
-                    break;
-                case "/removekey":
-                    await handleRemoveKey(args, env);
-                    break;
-                case "/listkeys":
-                    await handleListKeys(env);
-                    break;
-                case "/status":
-                    await handleStatus(env);
-                    break;
-                case "/refresh":
-                    await handleForceRefresh(args, env);
-                    break;
-                case "/refreshall":
-                    await handleRefreshAll(env);
-                    break;
-                case "/setlabel":
-                    await handleSetLabel(args, env);
-                    break;
-                case "/enable":
-                    await handleToggleKey(args, true, env);
-                    break;
-                case "/disable":
-                    await handleToggleKey(args, false, env);
-                    break;
-                case "/stats":
-                    await handleStats(env);
-                    break;
-                default:
-                    await sendTG(env, "❓ 未知命令，发送 /help 查看帮助");
-            }
-        } catch (err) {
-            console.error("[TG Command Error]", err.message);
-            await sendTG(env, `❌ 命令执行出错：${escHtml(err.message)}`);
-        }
-    }
-
-    return new Response("OK");
-}
-
-async function handleHelp(env) {
-    await sendTG(env,
-        `🤖 <b>Claude 代理管理 Bot</b>\n\n` +
-        `<b>Key 管理：</b>\n` +
-        `/addkey &lt;label&gt; &lt;JSON配置&gt; — 添加 OAuth Key\n` +
-        `/removekey &lt;label&gt; — 删除 Key\n` +
-        `/listkeys — 列出所有 Key\n` +
-        `/status — 查看详细状态\n` +
-        `/setlabel &lt;旧label&gt; &lt;新label&gt; — 重命名\n\n` +
-        `<b>启用/禁用：</b>\n` +
-        `/enable &lt;label&gt; — 启用 Key\n` +
-        `/disable &lt;label&gt; — 禁用 Key（不参与负载均衡）\n\n` +
-        `<b>刷新：</b>\n` +
-        `/refresh &lt;label&gt; — 强制刷新指定 Key\n` +
-        `/refreshall — 强制刷新所有 Key\n\n` +
-        `<b>统计：</b>\n` +
-        `/stats — 查看使用统计\n\n` +
-        `<b>添加示例：</b>\n` +
-        `<code>/addkey mykey1 {"claudeAiOauth":{"accessToken":"sk-ant-oat01-xxx","refreshToken":"sk-ant-ort01-xxx","expiresAt":1772108485349}}</code>`
-    );
-}
-
-async function handleAddKey(args, msg, env) {
-    if (args.length < 2) {
-        await sendTG(env, "⚠️ 格式：/addkey &lt;label&gt; &lt;JSON配置&gt;\n\n例如：\n<code>/addkey mykey1 {\"claudeAiOauth\":{...}}</code>");
-        return;
-    }
-
-    const label = args[0];
-    const jsonStr = args.slice(1).join(" ");
-
-    let parsed;
     try {
-        parsed = JSON.parse(jsonStr);
-    } catch (e) {
-        await sendTG(env, `❌ JSON 解析失败：${escHtml(e.message)}\n\n请确保 JSON 格式正确`);
-        return;
-    }
-
-    const oauth = parsed.claudeAiOauth;
-    if (!oauth || !oauth.accessToken || !oauth.refreshToken) {
-        await sendTG(env, "❌ JSON 缺少必要字段：claudeAiOauth.accessToken 和 refreshToken");
-        return;
-    }
-
-    // 检查 label 是否已存在
-    const existing = await getKey(env, label);
-    if (existing) {
-        await sendTG(env, `⚠️ Label "<b>${escHtml(label)}</b>" 已存在，将覆盖旧数据`);
-    }
-
-    const keyData = {
-        label: label,
-        accessToken: oauth.accessToken,
-        refreshToken: oauth.refreshToken,
-        expiresAt: oauth.expiresAt || 0,
-        scopes: oauth.scopes || [],
-        subscriptionType: oauth.subscriptionType || "unknown",
-        rateLimitTier: oauth.rateLimitTier || "default",
-        enabled: true,
-        addedAt: new Date().toISOString(),
-        addedBy: msg.from ? `${msg.from.first_name || ""} (${msg.from.id})` : "unknown",
-        lastRefreshed: null,
-        lastUsed: null,
-        useCount: 0,
-        errorCount: 0,
-    };
-
-    await saveKey(env, label, keyData);
-
-    const expStr = keyData.expiresAt
-        ? new Date(keyData.expiresAt).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" })
-        : "未知";
-
-    await sendTG(env,
-        `✅ <b>Key 添加成功</b>\n\n` +
-        `📛 Label: <code>${escHtml(label)}</code>\n` +
-        `📋 订阅: ${escHtml(keyData.subscriptionType)}\n` +
-        `⏰ 到期: ${expStr}\n` +
-        `🔑 Token: <code>${oauth.accessToken.substring(0, 25)}...</code>\n\n` +
-        `此 Key 已加入负载均衡池，将自动刷新。`
-    );
-}
-
-async function handleRemoveKey(args, env) {
-    if (args.length < 1) {
-        await sendTG(env, "⚠️ 格式：/removekey &lt;label&gt;");
-        return;
-    }
-
-    const label = args[0];
-    const existing = await getKey(env, label);
-    if (!existing) {
-        await sendTG(env, `❌ 未找到 Label "<b>${escHtml(label)}</b>"`);
-        return;
-    }
-
-    await deleteKey(env, label);
-    await sendTG(env, `🗑️ Key "<b>${escHtml(label)}</b>" 已删除`);
-}
-
-async function handleListKeys(env) {
-    const keys = await listAllKeys(env);
-    if (keys.length === 0) {
-        await sendTG(env, "📭 当前没有存储任何 Key\n\n使用 /addkey 添加");
-        return;
-    }
-
-    const now = Date.now();
-    let text = `📋 <b>Key 列表 (${keys.length} 个)</b>\n\n`;
-
-    for (const k of keys) {
-        const remainMin = k.expiresAt ? Math.round((k.expiresAt - now) / 60000) : "?";
-        const statusIcon = !k.enabled ? "⏸️" : (remainMin > 10 ? "✅" : (remainMin > 0 ? "⚠️" : "❌"));
-        const enableStr = k.enabled ? "启用" : "禁用";
-
-        text += `${statusIcon} <b>${escHtml(k.label)}</b>\n`;
-        text += `   状态: ${enableStr} | 剩余: ${remainMin}分钟\n`;
-        text += `   使用: ${k.useCount || 0}次 | 错误: ${k.errorCount || 0}次\n`;
-        text += `   订阅: ${k.subscriptionType || "?"}\n\n`;
-    }
-
-    await sendTGLong(env, text);
-}
-
-async function handleStatus(env) {
-    const keys = await listAllKeys(env);
-    const now = Date.now();
-    const activeKeys = keys.filter(k => k.enabled && k.expiresAt > now);
-
-    let text = `📊 <b>系统状态</b>\n\n`;
-    text += `总 Key 数: ${keys.length}\n`;
-    text += `活跃 Key: ${activeKeys.length}\n`;
-    text += `禁用 Key: ${keys.filter(k => !k.enabled).length}\n`;
-    text += `过期 Key: ${keys.filter(k => k.enabled && k.expiresAt <= now).length}\n\n`;
-
-    for (const k of keys) {
-        const remainMin = k.expiresAt ? Math.round((k.expiresAt - now) / 60000) : "?";
-        const expStr = k.expiresAt
-            ? new Date(k.expiresAt).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" })
-            : "未知";
-
-        text += `━━━━━━━━━━━━━━━\n`;
-        text += `📛 <b>${escHtml(k.label)}</b>\n`;
-        text += `   启用: ${k.enabled ? "✅ 是" : "⏸️ 否"}\n`;
-        text += `   到期: ${expStr} (${remainMin}分)\n`;
-        text += `   订阅: ${k.subscriptionType || "?"}\n`;
-        text += `   使用: ${k.useCount || 0}次\n`;
-        text += `   错误: ${k.errorCount || 0}次\n`;
-        text += `   上次使用: ${k.lastUsed || "从未"}\n`;
-        text += `   上次刷新: ${k.lastRefreshed || "从未"}\n`;
-        text += `   Token: <code>${(k.accessToken || "").substring(0, 20)}...</code>\n\n`;
-    }
-
-    await sendTGLong(env, text);
-}
-
-async function handleForceRefresh(args, env) {
-    if (args.length < 1) {
-        await sendTG(env, "⚠️ 格式：/refresh &lt;label&gt;");
-        return;
-    }
-
-    const label = args[0];
-    const keyData = await getKey(env, label);
-    if (!keyData) {
-        await sendTG(env, `❌ 未找到 Label "<b>${escHtml(label)}</b>"`);
-        return;
-    }
-
-    await sendTG(env, `🔄 正在刷新 "<b>${escHtml(label)}</b>"...`);
-    const result = await refreshSingleKey(env, keyData);
-
-    if (result.success) {
-        await sendTG(env,
-            `✅ <b>刷新成功</b>\n\n` +
-            `📛 ${escHtml(label)}\n` +
-            `⏰ 新到期: ${result.expireStr}\n` +
-            `🔑 新Token: <code>${result.newToken.substring(0, 25)}...</code>`
-        );
-    } else {
-        await sendTG(env, `❌ 刷新失败：${escHtml(result.error)}`);
+        var resp = await fetch("https://api.telegram.org/bot" + botToken + "/sendMessage", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                chat_id: chatId,
+                text: message,
+                parse_mode: "HTML",
+                disable_web_page_preview: true
+            })
+        });
+        if (!resp.ok) {
+            var errText = await resp.text();
+            console.error("[TG] Send failed:", resp.status, errText);
+            return false;
+        }
+        return true;
+    } catch (err) {
+        console.error("[TG] Error:", err.message);
+        return false;
     }
 }
 
-async function handleRefreshAll(env) {
-    await sendTG(env, "🔄 正在刷新所有 Key...");
-    const result = await checkAndRefreshAllKeys(env, true);
-    await sendTG(env,
-        `✅ <b>批量刷新完成</b>\n\n` +
-        `检查: ${result.checked} 个\n` +
-        `刷新: ${result.refreshed} 个\n` +
-        `失败: ${result.failed} 个\n` +
-        `跳过: ${result.skipped} 个`
-    );
-}
-
-async function handleSetLabel(args, env) {
-    if (args.length < 2) {
-        await sendTG(env, "⚠️ 格式：/setlabel &lt;旧label&gt; &lt;新label&gt;");
-        return;
+async function sendTGLong(env, message) {
+    var MAX_LEN = 4000;
+    if (message.length <= MAX_LEN) {
+        return await sendTG(env, message);
     }
-
-    const [oldLabel, newLabel] = args;
-    const keyData = await getKey(env, oldLabel);
-    if (!keyData) {
-        await sendTG(env, `❌ 未找到 Label "<b>${escHtml(oldLabel)}</b>"`);
-        return;
+    var parts = [];
+    var remaining = message;
+    while (remaining.length > 0) {
+        parts.push(remaining.substring(0, MAX_LEN));
+        remaining = remaining.substring(MAX_LEN);
     }
-
-    const existingNew = await getKey(env, newLabel);
-    if (existingNew) {
-        await sendTG(env, `❌ Label "<b>${escHtml(newLabel)}</b>" 已被占用`);
-        return;
+    for (var i = 0; i < parts.length; i++) {
+        var header = parts.length > 1 ? ("📄 (" + (i + 1) + "/" + parts.length + ")\n") : "";
+        await sendTG(env, header + parts[i]);
+        if (i < parts.length - 1) await sleep(500);
     }
-
-    keyData.label = newLabel;
-    await saveKey(env, newLabel, keyData);
-    await deleteKey(env, oldLabel);
-    await sendTG(env, `✅ 已重命名：<b>${escHtml(oldLabel)}</b> → <b>${escHtml(newLabel)}</b>`);
-}
-
-async function handleToggleKey(args, enabled, env) {
-    if (args.length < 1) {
-        await sendTG(env, `⚠️ 格式：/${enabled ? "enable" : "disable"} &lt;label&gt;`);
-        return;
-    }
-
-    const label = args[0];
-    const keyData = await getKey(env, label);
-    if (!keyData) {
-        await sendTG(env, `❌ 未找到 Label "<b>${escHtml(label)}</b>"`);
-        return;
-    }
-
-    keyData.enabled = enabled;
-    await saveKey(env, label, keyData);
-    await sendTG(env, `${enabled ? "✅ 已启用" : "⏸️ 已禁用"} Key "<b>${escHtml(label)}</b>"`);
-}
-
-async function handleStats(env) {
-    const keys = await listAllKeys(env);
-    const totalUse = keys.reduce((s, k) => s + (k.useCount || 0), 0);
-    const totalErr = keys.reduce((s, k) => s + (k.errorCount || 0), 0);
-
-    // 读取全局统计
-    const globalStats = await getGlobalStats(env);
-
-    let text = `📈 <b>使用统计</b>\n\n`;
-    text += `总请求数: ${globalStats.totalRequests || 0}\n`;
-    text += `总 Key 调用: ${totalUse}\n`;
-    text += `总错误数: ${totalErr}\n`;
-    text += `今日请求: ${globalStats.todayRequests || 0}\n\n`;
-
-    text += `<b>各 Key 使用排名：</b>\n`;
-    const sorted = [...keys].sort((a, b) => (b.useCount || 0) - (a.useCount || 0));
-    for (let i = 0; i < sorted.length; i++) {
-        const k = sorted[i];
-        text += `${i + 1}. ${escHtml(k.label)} — ${k.useCount || 0}次 (错误${k.errorCount || 0})\n`;
-    }
-
-    await sendTG(env, text);
-}
-
-// ================================================================
-// 负载均衡：选择最优 Key
-// ================================================================
-async function selectKey(env) {
-    const keys = await listAllKeys(env);
-    const now = Date.now();
-    const bufferTime = 2 * 60 * 1000; // 2分钟缓冲
-
-    // 过滤出可用的 key
-    const available = keys.filter(k =>
-        k.enabled &&
-        k.accessToken &&
-        k.expiresAt > now + bufferTime
-    );
-
-    if (available.length === 0) {
-        console.error("[LB] No available keys!");
-        return null;
-    }
-
-    // 负载均衡策略：加权最少使用 + 错误惩罚
-    // 分数越低越优先
-    const scored = available.map(k => {
-        const useScore = (k.useCount || 0);
-        const errorPenalty = (k.errorCount || 0) * 10;
-        const recentErrorPenalty = k.lastErrorAt && (now - new Date(k.lastErrorAt).getTime() < 300000) ? 50 : 0;
-        const freshBonus = k.lastUsed ? 0 : -5; // 从未使用过的优先
-
-        return {
-            key: k,
-            score: useScore + errorPenalty + recentErrorPenalty + freshBonus
-        };
-    });
-
-    scored.sort((a, b) => a.score - b.score);
-
-    // 从得分最低的前几个中随机选一个（避免总是打同一个）
-    const topN = Math.min(3, scored.length);
-    const selected = scored[Math.floor(Math.random() * topN)];
-
-    console.log(`[LB] Selected key "${selected.key.label}" (score: ${selected.score}, from ${available.length} available)`);
-    return selected.key;
-}
-
-// 更新 Key 使用统计
-async function recordKeyUsage(env, label, success) {
-    const keyData = await getKey(env, label);
-    if (!keyData) return;
-
-    keyData.useCount = (keyData.useCount || 0) + 1;
-    keyData.lastUsed = new Date().toISOString();
-
-    if (!success) {
-        keyData.errorCount = (keyData.errorCount || 0) + 1;
-        keyData.lastErrorAt = new Date().toISOString();
-    }
-
-    await saveKey(env, label, keyData);
-
-    // 更新全局统计
-    await incrementGlobalStats(env);
+    return true;
 }
 
 // ================================================================
 // KV 存储操作
 // ================================================================
+
 async function saveKey(env, label, data) {
     if (!env.TOKEN_STORE) return;
     try {
-        await env.TOKEN_STORE.put(`key:${label}`, JSON.stringify(data));
+        await env.TOKEN_STORE.put("key:" + label, JSON.stringify(data));
     } catch (e) {
-        console.error("[KV Save Error]", e.message);
+        console.error("[KV Save]", e.message);
     }
 }
 
 async function getKey(env, label) {
     if (!env.TOKEN_STORE) return null;
     try {
-        return await env.TOKEN_STORE.get(`key:${label}`, { type: "json" });
+        return await env.TOKEN_STORE.get("key:" + label, { type: "json" });
     } catch (e) {
-        console.error("[KV Get Error]", e.message);
+        console.error("[KV Get]", e.message);
         return null;
     }
 }
@@ -545,24 +137,24 @@ async function getKey(env, label) {
 async function deleteKey(env, label) {
     if (!env.TOKEN_STORE) return;
     try {
-        await env.TOKEN_STORE.delete(`key:${label}`);
+        await env.TOKEN_STORE.delete("key:" + label);
     } catch (e) {
-        console.error("[KV Delete Error]", e.message);
+        console.error("[KV Delete]", e.message);
     }
 }
 
 async function listAllKeys(env) {
     if (!env.TOKEN_STORE) return [];
     try {
-        const list = await env.TOKEN_STORE.list({ prefix: "key:" });
-        const keys = [];
-        for (const item of list.keys) {
-            const data = await env.TOKEN_STORE.get(item.name, { type: "json" });
+        var list = await env.TOKEN_STORE.list({ prefix: "key:" });
+        var keys = [];
+        for (var i = 0; i < list.keys.length; i++) {
+            var data = await env.TOKEN_STORE.get(list.keys[i].name, { type: "json" });
             if (data) keys.push(data);
         }
         return keys;
     } catch (e) {
-        console.error("[KV List Error]", e.message);
+        console.error("[KV List]", e.message);
         return [];
     }
 }
@@ -579,8 +171,8 @@ async function getGlobalStats(env) {
 async function incrementGlobalStats(env) {
     if (!env.TOKEN_STORE) return;
     try {
-        const stats = await getGlobalStats(env);
-        const today = new Date().toISOString().split("T")[0];
+        var stats = await getGlobalStats(env);
+        var today = new Date().toISOString().split("T")[0];
         stats.totalRequests = (stats.totalRequests || 0) + 1;
         if (stats.today === today) {
             stats.todayRequests = (stats.todayRequests || 0) + 1;
@@ -590,18 +182,19 @@ async function incrementGlobalStats(env) {
         }
         await env.TOKEN_STORE.put("stats:global", JSON.stringify(stats));
     } catch (e) {
-        console.error("[Stats Error]", e.message);
+        console.error("[Stats]", e.message);
     }
 }
 
 // ================================================================
 // Token 刷新
 // ================================================================
+
 async function refreshTokenWithLock(refreshToken) {
     if (pendingRefreshes.has(refreshToken)) {
         return pendingRefreshes.get(refreshToken);
     }
-    const promise = performTokenRefresh(refreshToken);
+    var promise = performTokenRefresh(refreshToken);
     pendingRefreshes.set(refreshToken, promise);
     try {
         return await promise;
@@ -612,7 +205,7 @@ async function refreshTokenWithLock(refreshToken) {
 
 async function performTokenRefresh(refreshToken) {
     try {
-        const resp = await fetch("https://console.anthropic.com/v1/oauth/token", {
+        var resp = await fetch("https://console.anthropic.com/v1/oauth/token", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
@@ -622,64 +215,56 @@ async function performTokenRefresh(refreshToken) {
             })
         });
         if (!resp.ok) {
-            const errText = await resp.text().catch(() => "");
-            console.error(`[Refresh] HTTP ${resp.status}: ${errText}`);
+            var errText = await resp.text().catch(function() { return ""; });
+            console.error("[Refresh] HTTP " + resp.status + ": " + errText);
             return null;
         }
         return await resp.json();
     } catch (err) {
-        console.error("[Refresh] Network error:", err.message);
+        console.error("[Refresh] Error:", err.message);
         return null;
     }
 }
 
 async function refreshSingleKey(env, keyData) {
-    const now = Date.now();
-    const refreshed = await refreshTokenWithLock(keyData.refreshToken);
-
+    var now = Date.now();
+    var refreshed = await refreshTokenWithLock(keyData.refreshToken);
     if (!refreshed || !refreshed.access_token) {
         return { success: false, error: "Refresh API returned no token" };
     }
-
-    const newExpiresAt = now + ((refreshed.expires_in || 3600) * 1000);
-    const expireStr = new Date(newExpiresAt).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" });
+    var newExpiresAt = now + ((refreshed.expires_in || 3600) * 1000);
+    var expireStr = new Date(newExpiresAt).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" });
 
     keyData.accessToken = refreshed.access_token;
     keyData.refreshToken = refreshed.refresh_token || keyData.refreshToken;
     keyData.expiresAt = newExpiresAt;
     keyData.lastRefreshed = new Date().toISOString();
-
     await saveKey(env, keyData.label, keyData);
 
-    return { success: true, newToken: refreshed.access_token, expireStr };
+    return { success: true, newToken: refreshed.access_token, expireStr: expireStr };
 }
 
-async function checkAndRefreshAllKeys(env, forceAll = false) {
-    const keys = await listAllKeys(env);
-    const now = Date.now();
-    const bufferTime = 10 * 60 * 1000;
-    let refreshed = 0, failed = 0, skipped = 0;
+async function checkAndRefreshAllKeys(env, forceAll) {
+    var keys = await listAllKeys(env);
+    var now = Date.now();
+    var bufferTime = 10 * 60 * 1000;
+    var refreshed = 0;
+    var failed = 0;
+    var skipped = 0;
 
-    for (const keyData of keys) {
-        if (!keyData.enabled) {
-            skipped++;
-            continue;
-        }
+    for (var i = 0; i < keys.length; i++) {
+        var keyData = keys[i];
+        if (!keyData.enabled) { skipped++; continue; }
 
-        const needsRefresh = forceAll || !keyData.expiresAt || keyData.expiresAt < now + bufferTime;
-        if (!needsRefresh) {
-            skipped++;
-            continue;
-        }
+        var needsRefresh = forceAll || !keyData.expiresAt || keyData.expiresAt < now + bufferTime;
+        if (!needsRefresh) { skipped++; continue; }
 
-        console.log(`[Cron] Refreshing "${keyData.label}"`);
-        const result = await refreshSingleKey(env, keyData);
+        console.log("[Cron] Refreshing: " + keyData.label);
+        var result = await refreshSingleKey(env, keyData);
 
         if (result.success) {
             refreshed++;
-
-            // 构建完整配置用于 Telegram 通知
-            const fullConfig = {
+            var fullConfig = {
                 claudeAiOauth: {
                     accessToken: keyData.accessToken,
                     refreshToken: keyData.refreshToken,
@@ -689,62 +274,805 @@ async function checkAndRefreshAllKeys(env, forceAll = false) {
                     rateLimitTier: keyData.rateLimitTier || "default",
                 }
             };
-
             await sendTGLong(env,
-                `🔄 <b>Token 自动刷新成功</b>\n\n` +
-                `📛 Label: <b>${escHtml(keyData.label)}</b>\n` +
-                `⏰ 新到期: ${result.expireStr}\n\n` +
-                `<b>完整配置（备份用）：</b>\n` +
-                `<pre>${escHtml(JSON.stringify(fullConfig, null, 2))}</pre>`
+                "🔄 <b>Token 自动刷新成功</b>\n\n" +
+                "📛 Label: <b>" + escHtml(keyData.label) + "</b>\n" +
+                "⏰ 新到期: " + result.expireStr + "\n\n" +
+                "<b>完整配置（备份用）：</b>\n" +
+                "<pre>" + escHtml(JSON.stringify(fullConfig, null, 2)) + "</pre>"
             );
         } else {
             failed++;
             await sendTG(env,
-                `❌ <b>Token 刷新失败</b>\n\n` +
-                `📛 Label: <b>${escHtml(keyData.label)}</b>\n` +
-                `原因: ${escHtml(result.error)}\n\n` +
-                `请检查 refreshToken 是否仍然有效`
+                "❌ <b>Token 刷新失败</b>\n\n" +
+                "📛 Label: <b>" + escHtml(keyData.label) + "</b>\n" +
+                "原因: " + escHtml(result.error)
             );
         }
-
-        // 避免频率限制
         await sleep(1000);
     }
 
-    console.log(`[Cron] Done: ${refreshed} refreshed, ${failed} failed, ${skipped} skipped`);
-    return { checked: keys.length, refreshed, failed, skipped };
+    console.log("[Cron] Done: " + refreshed + " refreshed, " + failed + " failed, " + skipped + " skipped");
+    return { checked: keys.length, refreshed: refreshed, failed: failed, skipped: skipped };
+}
+
+// ================================================================
+// 负载均衡
+// ================================================================
+
+async function selectKey(env) {
+    var keys = await listAllKeys(env);
+    var now = Date.now();
+    var bufferTime = 2 * 60 * 1000;
+
+    var available = keys.filter(function(k) {
+        return k.enabled && k.accessToken && k.expiresAt > now + bufferTime;
+    });
+
+    if (available.length === 0) {
+        console.error("[LB] No available keys");
+        return null;
+    }
+
+    var scored = available.map(function(k) {
+        var useScore = k.useCount || 0;
+        var errorPenalty = (k.errorCount || 0) * 10;
+        var recentErr = (k.lastErrorAt && (now - new Date(k.lastErrorAt).getTime() < 300000)) ? 50 : 0;
+        var freshBonus = k.lastUsed ? 0 : -5;
+        return { key: k, score: useScore + errorPenalty + recentErr + freshBonus };
+    });
+
+    scored.sort(function(a, b) { return a.score - b.score; });
+
+    var topN = Math.min(3, scored.length);
+    var selected = scored[Math.floor(Math.random() * topN)];
+    console.log("[LB] Selected: " + selected.key.label + " (score: " + selected.score + ", pool: " + available.length + ")");
+    return selected.key;
+}
+
+async function recordKeyUsage(env, label, success) {
+    var keyData = await getKey(env, label);
+    if (!keyData) return;
+    keyData.useCount = (keyData.useCount || 0) + 1;
+    keyData.lastUsed = new Date().toISOString();
+    if (!success) {
+        keyData.errorCount = (keyData.errorCount || 0) + 1;
+        keyData.lastErrorAt = new Date().toISOString();
+    }
+    await saveKey(env, label, keyData);
+    await incrementGlobalStats(env);
+}
+
+// ================================================================
+// 鉴权
+// ================================================================
+
+function validateCustomToken(authHeader, env) {
+    var token = authHeader.replace(/^Bearer\s+/i, "").trim();
+    if (!token) return false;
+    var allowed = (env.CUSTOM_TOKENS || "").split(",").map(function(t) { return t.trim(); }).filter(Boolean);
+    if (allowed.length === 0) {
+        console.warn("[Auth] No CUSTOM_TOKENS configured");
+        return false;
+    }
+    return allowed.indexOf(token) !== -1;
+}
+
+// ================================================================
+// 格式转换
+// ================================================================
+
+function convertContent(content) {
+    if (typeof content === "string") return content;
+    if (Array.isArray(content)) {
+        var parts = [];
+        for (var i = 0; i < content.length; i++) {
+            var part = content[i];
+            if (part.type === "text") {
+                parts.push({ type: "text", text: part.text });
+            } else if (part.type === "image_url" && part.image_url) {
+                var url = part.image_url.url || "";
+                var match = url.match(/^data:(image\/[a-zA-Z+]+);base64,(.+)$/);
+                if (match) {
+                    parts.push({ type: "image", source: { type: "base64", media_type: match[1], data: match[2] } });
+                } else {
+                    parts.push({ type: "text", text: "[Image: " + url + "]" });
+                }
+            }
+        }
+        return parts.length > 0 ? parts : "(empty)";
+    }
+    return typeof content === "object" ? JSON.stringify(content) : String(content);
+}
+
+function convertTool(openaiTool) {
+    if (openaiTool.type === "function" && openaiTool.function) {
+        return {
+            name: openaiTool.function.name,
+            description: openaiTool.function.description || "",
+            input_schema: openaiTool.function.parameters || { type: "object", properties: {} }
+        };
+    }
+    return openaiTool;
+}
+
+function mergeConsecutiveRoles(messages) {
+    if (messages.length === 0) return [];
+    var merged = [];
+    for (var i = 0; i < messages.length; i++) {
+        var msg = messages[i];
+        if (merged.length > 0 && merged[merged.length - 1].role === msg.role) {
+            var last = merged[merged.length - 1];
+            if (typeof last.content === "string" && typeof msg.content === "string") {
+                last.content += "\n\n" + msg.content;
+            } else {
+                var toArr = function(c) {
+                    if (Array.isArray(c)) return c;
+                    if (typeof c === "string") return [{ type: "text", text: c }];
+                    return [c];
+                };
+                last.content = toArr(last.content).concat(toArr(msg.content));
+            }
+        } else {
+            merged.push({ role: msg.role, content: msg.content });
+        }
+    }
+    return merged;
+}
+
+function anthropicToOpenaiResp(data, model, injectionText) {
+    var message = { role: "assistant", content: null };
+    var textParts = [];
+    var toolCalls = [];
+    var reasoningContent = "";
+
+    if (data.content && Array.isArray(data.content)) {
+        for (var i = 0; i < data.content.length; i++) {
+            var block = data.content[i];
+            if (block.type === "text") {
+                textParts.push(block.text);
+            } else if (block.type === "tool_use") {
+                toolCalls.push({
+                    id: block.id,
+                    type: "function",
+                    function: { name: block.name, arguments: JSON.stringify(block.input) }
+                });
+            } else if (block.type === "thinking") {
+                reasoningContent += block.thinking;
+            }
+        }
+    }
+
+    var fullText = textParts.join("");
+    message.content = injectionText ? (injectionText + fullText) : (fullText || null);
+    if (toolCalls.length > 0) message.tool_calls = toolCalls;
+    if (reasoningContent) message.reasoning_content = reasoningContent;
+
+    return {
+        id: data.id || ("chatcmpl-" + crypto.randomUUID()),
+        object: "chat.completion",
+        created: Math.floor(Date.now() / 1000),
+        model: model,
+        choices: [{ index: 0, message: message, finish_reason: mapStopReason(data.stop_reason) }],
+        usage: {
+            prompt_tokens: (data.usage && data.usage.input_tokens) || 0,
+            completion_tokens: (data.usage && data.usage.output_tokens) || 0,
+            total_tokens: ((data.usage && data.usage.input_tokens) || 0) + ((data.usage && data.usage.output_tokens) || 0)
+        }
+    };
+}
+
+// ================================================================
+// Telegram Webhook 处理
+// ================================================================
+
+async function setupTelegramWebhook(url, env) {
+    var botToken = env.TELEGRAM_BOT_TOKEN;
+    if (!botToken) {
+        return corsResponse(JSON.stringify({ error: "TELEGRAM_BOT_TOKEN not set" }), 500);
+    }
+    var webhookUrl = url.origin + "/telegram/webhook";
+    var resp = await fetch("https://api.telegram.org/bot" + botToken + "/setWebhook", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: webhookUrl })
+    });
+    var result = await resp.json();
+    return corsResponse(JSON.stringify({ webhook_url: webhookUrl, telegram_response: result }));
+}
+
+async function handleTelegramWebhook(request, env) {
+    var update = await request.json().catch(function() { return null; });
+    if (!update || !update.message) return new Response("OK");
+
+    var msg = update.message;
+    var chatId = String(msg.chat.id);
+    var allowedChatId = String(env.TELEGRAM_CHAT_ID || "");
+    var text = (msg.text || "").trim();
+
+    if (chatId !== allowedChatId) {
+        console.log("[TG] Ignored chat " + chatId);
+        return new Response("OK");
+    }
+
+    if (!text.startsWith("/")) return new Response("OK");
+
+    var parts = text.split(/\s+/);
+    var cmd = parts[0].toLowerCase().split("@")[0];
+    var args = parts.slice(1);
+
+    try {
+        switch (cmd) {
+            case "/help":
+                await sendTG(env,
+                    "🤖 <b>Claude 代理管理 Bot</b>\n\n" +
+                    "<b>Key 管理：</b>\n" +
+                    "/addkey &lt;label&gt; &lt;JSON&gt; — 添加 Key\n" +
+                    "/removekey &lt;label&gt; — 删除 Key\n" +
+                    "/listkeys — 列出所有 Key\n" +
+                    "/status — 详细状态\n" +
+                    "/setlabel &lt;旧&gt; &lt;新&gt; — 重命名\n\n" +
+                    "<b>启用/禁用：</b>\n" +
+                    "/enable &lt;label&gt; — 启用\n" +
+                    "/disable &lt;label&gt; — 禁用\n\n" +
+                    "<b>刷新：</b>\n" +
+                    "/refresh &lt;label&gt; — 刷新指定 Key\n" +
+                    "/refreshall — 刷新所有\n\n" +
+                    "<b>统计：</b>\n" +
+                    "/stats — 使用统计"
+                );
+                break;
+
+            case "/addkey":
+                if (args.length < 2) {
+                    await sendTG(env, "⚠️ 格式：/addkey &lt;label&gt; &lt;JSON配置&gt;");
+                    break;
+                }
+                var label = args[0];
+                var jsonStr = args.slice(1).join(" ");
+                var parsed;
+                try { parsed = JSON.parse(jsonStr); } catch (e) {
+                    await sendTG(env, "❌ JSON 解析失败：" + escHtml(e.message));
+                    break;
+                }
+                var oauth = parsed.claudeAiOauth;
+                if (!oauth || !oauth.accessToken || !oauth.refreshToken) {
+                    await sendTG(env, "❌ 缺少 accessToken 或 refreshToken");
+                    break;
+                }
+                var keyData = {
+                    label: label,
+                    accessToken: oauth.accessToken,
+                    refreshToken: oauth.refreshToken,
+                    expiresAt: oauth.expiresAt || 0,
+                    scopes: oauth.scopes || [],
+                    subscriptionType: oauth.subscriptionType || "unknown",
+                    rateLimitTier: oauth.rateLimitTier || "default",
+                    enabled: true,
+                    addedAt: new Date().toISOString(),
+                    addedBy: msg.from ? (msg.from.first_name || "") + " (" + msg.from.id + ")" : "unknown",
+                    lastRefreshed: null,
+                    lastUsed: null,
+                    useCount: 0,
+                    errorCount: 0,
+                };
+                await saveKey(env, label, keyData);
+                var expStr = keyData.expiresAt ? new Date(keyData.expiresAt).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" }) : "未知";
+                await sendTG(env,
+                    "✅ <b>Key 添加成功</b>\n\n" +
+                    "📛 Label: <code>" + escHtml(label) + "</code>\n" +
+                    "📋 订阅: " + escHtml(keyData.subscriptionType) + "\n" +
+                    "⏰ 到期: " + expStr + "\n" +
+                    "🔑 Token: <code>" + oauth.accessToken.substring(0, 25) + "...</code>"
+                );
+                break;
+
+            case "/removekey":
+                if (args.length < 1) { await sendTG(env, "⚠️ 格式：/removekey &lt;label&gt;"); break; }
+                var existing = await getKey(env, args[0]);
+                if (!existing) { await sendTG(env, "❌ 未找到: " + escHtml(args[0])); break; }
+                await deleteKey(env, args[0]);
+                await sendTG(env, "🗑️ 已删除: <b>" + escHtml(args[0]) + "</b>");
+                break;
+
+            case "/listkeys":
+                var allKeys = await listAllKeys(env);
+                if (allKeys.length === 0) { await sendTG(env, "📭 没有 Key，用 /addkey 添加"); break; }
+                var now = Date.now();
+                var listText = "📋 <b>Key 列表 (" + allKeys.length + " 个)</b>\n\n";
+                for (var ki = 0; ki < allKeys.length; ki++) {
+                    var k = allKeys[ki];
+                    var remainMin = k.expiresAt ? Math.round((k.expiresAt - now) / 60000) : "?";
+                    var icon = !k.enabled ? "⏸️" : (remainMin > 10 ? "✅" : (remainMin > 0 ? "⚠️" : "❌"));
+                    listText += icon + " <b>" + escHtml(k.label) + "</b> | " +
+                        (k.enabled ? "启用" : "禁用") + " | " + remainMin + "分 | " +
+                        (k.useCount || 0) + "次 | 错误" + (k.errorCount || 0) + "\n";
+                }
+                await sendTGLong(env, listText);
+                break;
+
+            case "/status":
+                var sKeys = await listAllKeys(env);
+                var sNow = Date.now();
+                var sText = "📊 <b>系统状态</b>\n\n" +
+                    "总 Key: " + sKeys.length + "\n" +
+                    "活跃: " + sKeys.filter(function(k) { return k.enabled && k.expiresAt > sNow; }).length + "\n\n";
+                for (var si = 0; si < sKeys.length; si++) {
+                    var sk = sKeys[si];
+                    var sRemain = sk.expiresAt ? Math.round((sk.expiresAt - sNow) / 60000) : "?";
+                    var sExp = sk.expiresAt ? new Date(sk.expiresAt).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" }) : "未知";
+                    sText += "━━━━━━━━━━━━━━━\n" +
+                        "📛 <b>" + escHtml(sk.label) + "</b>\n" +
+                        "   启用: " + (sk.enabled ? "✅" : "⏸️") + " | 到期: " + sExp + " (" + sRemain + "分)\n" +
+                        "   使用: " + (sk.useCount || 0) + "次 | 错误: " + (sk.errorCount || 0) + "\n" +
+                        "   上次使用: " + (sk.lastUsed || "从未") + "\n\n";
+                }
+                await sendTGLong(env, sText);
+                break;
+
+            case "/refresh":
+                if (args.length < 1) { await sendTG(env, "⚠️ 格式：/refresh &lt;label&gt;"); break; }
+                var rKey = await getKey(env, args[0]);
+                if (!rKey) { await sendTG(env, "❌ 未找到: " + escHtml(args[0])); break; }
+                await sendTG(env, "🔄 正在刷新 " + escHtml(args[0]) + "...");
+                var rResult = await refreshSingleKey(env, rKey);
+                if (rResult.success) {
+                    await sendTG(env, "✅ 刷新成功\n⏰ 新到期: " + rResult.expireStr);
+                } else {
+                    await sendTG(env, "❌ 刷新失败: " + escHtml(rResult.error));
+                }
+                break;
+
+            case "/refreshall":
+                await sendTG(env, "🔄 正在刷新所有 Key...");
+                var raResult = await checkAndRefreshAllKeys(env, true);
+                await sendTG(env,
+                    "✅ <b>批量刷新完成</b>\n" +
+                    "检查: " + raResult.checked + " | 刷新: " + raResult.refreshed +
+                    " | 失败: " + raResult.failed + " | 跳过: " + raResult.skipped
+                );
+                break;
+
+            case "/setlabel":
+                if (args.length < 2) { await sendTG(env, "⚠️ 格式：/setlabel &lt;旧&gt; &lt;新&gt;"); break; }
+                var oldKey = await getKey(env, args[0]);
+                if (!oldKey) { await sendTG(env, "❌ 未找到: " + escHtml(args[0])); break; }
+                var newExists = await getKey(env, args[1]);
+                if (newExists) { await sendTG(env, "❌ " + escHtml(args[1]) + " 已存在"); break; }
+                oldKey.label = args[1];
+                await saveKey(env, args[1], oldKey);
+                await deleteKey(env, args[0]);
+                await sendTG(env, "✅ 重命名: " + escHtml(args[0]) + " → " + escHtml(args[1]));
+                break;
+
+            case "/enable":
+                if (args.length < 1) { await sendTG(env, "⚠️ 格式：/enable &lt;label&gt;"); break; }
+                var enKey = await getKey(env, args[0]);
+                if (!enKey) { await sendTG(env, "❌ 未找到: " + escHtml(args[0])); break; }
+                enKey.enabled = true;
+                await saveKey(env, args[0], enKey);
+                await sendTG(env, "✅ 已启用: " + escHtml(args[0]));
+                break;
+
+            case "/disable":
+                if (args.length < 1) { await sendTG(env, "⚠️ 格式：/disable &lt;label&gt;"); break; }
+                var disKey = await getKey(env, args[0]);
+                if (!disKey) { await sendTG(env, "❌ 未找到: " + escHtml(args[0])); break; }
+                disKey.enabled = false;
+                await saveKey(env, args[0], disKey);
+                await sendTG(env, "⏸️ 已禁用: " + escHtml(args[0]));
+                break;
+
+            case "/stats":
+                var stKeys = await listAllKeys(env);
+                var gStats = await getGlobalStats(env);
+                var stText = "📈 <b>使用统计</b>\n\n" +
+                    "总请求: " + (gStats.totalRequests || 0) + "\n" +
+                    "今日请求: " + (gStats.todayRequests || 0) + "\n\n" +
+                    "<b>各 Key 排名：</b>\n";
+                var sorted = stKeys.slice().sort(function(a, b) { return (b.useCount || 0) - (a.useCount || 0); });
+                for (var sti = 0; sti < sorted.length; sti++) {
+                    stText += (sti + 1) + ". " + escHtml(sorted[sti].label) +
+                        " — " + (sorted[sti].useCount || 0) + "次 (错误" + (sorted[sti].errorCount || 0) + ")\n";
+                }
+                await sendTG(env, stText);
+                break;
+
+            default:
+                await sendTG(env, "❓ 未知命令，发送 /help 查看帮助");
+        }
+    } catch (err) {
+        console.error("[TG Cmd Error]", err.message);
+        await sendTG(env, "❌ 执行出错: " + escHtml(err.message));
+    }
+
+    return new Response("OK");
 }
 
 // ================================================================
 // 管理路由
 // ================================================================
+
 async function handleAdmin(url, request, env) {
-    const authHeader = request.headers.get("Authorization") || "";
-    const adminKey = authHeader.replace(/^Bearer\s+/i, "").trim();
+    var authHeader = request.headers.get("Authorization") || "";
+    var adminKey = authHeader.replace(/^Bearer\s+/i, "").trim();
     if (!env.ADMIN_KEY || adminKey !== env.ADMIN_KEY) {
         return corsResponse(JSON.stringify({ error: "Unauthorized" }), 401);
     }
-
     if (url.pathname === "/admin/status") {
-        const keys = await listAllKeys(env);
-        const now = Date.now();
-        return corsResponse(JSON.stringify(keys.map(k => ({
-            label: k.label,
-            enabled: k.enabled,
-            expiresAt: k.expiresAt ? new Date(k.expiresAt).toISOString() : null,
-            remainingMin: k.expiresAt ? Math.round((k.expiresAt - now) / 60000) : null,
-            useCount: k.useCount || 0,
-            errorCount: k.errorCount || 0,
-            lastUsed: k.lastUsed,
-        })), null, 2));
+        var keys = await listAllKeys(env);
+        var now = Date.now();
+        var result = keys.map(function(k) {
+            return {
+                label: k.label, enabled: k.enabled,
+                remainingMin: k.expiresAt ? Math.round((k.expiresAt - now) / 60000) : null,
+                useCount: k.useCount || 0, errorCount: k.errorCount || 0
+            };
+        });
+        return corsResponse(JSON.stringify(result, null, 2));
     }
-
     if (url.pathname === "/admin/refresh-all" && request.method === "POST") {
-        const result = await checkAndRefreshAllKeys(env, true);
-        return corsResponse(JSON.stringify(result));
+        var r = await checkAndRefreshAllKeys(env, true);
+        return corsResponse(JSON.stringify(r));
     }
-
     return corsResponse(JSON.stringify({ error: "Not Found" }), 404);
 }
 
 // ================================================================
+// 主请求处理
+// ================================================================
+
+async function handleChatCompletions(request, env) {
+    // 验证自定义 token
+    var authHeader = request.headers.get("Authorization") || "";
+    if (!validateCustomToken(authHeader, env)) {
+        return corsResponse(JSON.stringify({ error: "Invalid API key" }), 401);
+    }
+
+    // 负载均衡选择 key
+    var selectedKey = await selectKey(env);
+    if (!selectedKey) {
+        return corsResponse(JSON.stringify({
+            error: "No available API keys. Add keys via Telegram bot using /addkey command."
+        }), 503);
+    }
+
+    var activeAccessToken = selectedKey.accessToken;
+    var keyLabel = selectedKey.label;
+
+    // 解析请求
+    var openaiReq = await request.json().catch(function(e) {
+        console.error("[Body Parse]", e.message);
+        return {};
+    });
+
+    // 构建消息
+    var systemPrompt = "";
+    var rawMessages = [];
+    var msgs = openaiReq.messages || [];
+
+    for (var i = 0; i < msgs.length; i++) {
+        var m = msgs[i];
+        if (m.role === "system") {
+            systemPrompt += (typeof m.content === "string" ? m.content : JSON.stringify(m.content)) + "\n";
+        } else if (m.role === "user" || m.role === "assistant") {
+            rawMessages.push({ role: m.role, content: convertContent(m.content) });
+        } else if (m.role === "tool") {
+            rawMessages.push({
+                role: "user",
+                content: [{
+                    type: "tool_result",
+                    tool_use_id: m.tool_call_id || "unknown",
+                    content: typeof m.content === "string" ? m.content : JSON.stringify(m.content)
+                }]
+            });
+        } else {
+            rawMessages.push({ role: "user", content: typeof m.content === "string" ? m.content : JSON.stringify(m.content) });
+        }
+    }
+
+    var anthropicMessages = mergeConsecutiveRoles(rawMessages);
+    if (anthropicMessages.length > 0 && anthropicMessages[0].role !== "user") {
+        anthropicMessages.unshift({ role: "user", content: "(continued)" });
+    }
+
+    // 模型映射
+    var requestedModel = openaiReq.model || "claude-sonnet-4-5";
+    var model = MODEL_MAP[requestedModel] || MODEL_MAP["claude-sonnet-4-5"];
+
+    var anthropicReq = {
+        model: model,
+        max_tokens: openaiReq.max_tokens || 8192,
+        messages: anthropicMessages,
+    };
+
+    if (systemPrompt.trim()) anthropicReq.system = systemPrompt.trim();
+    if (openaiReq.stream) anthropicReq.stream = true;
+    if (openaiReq.temperature !== undefined) anthropicReq.temperature = openaiReq.temperature;
+    if (openaiReq.top_p !== undefined) anthropicReq.top_p = openaiReq.top_p;
+    if (openaiReq.tools && openaiReq.tools.length > 0) {
+        anthropicReq.tools = openaiReq.tools.map(convertTool);
+    }
+
+    // 请求头
+    var anthropicHeaders = {
+        "anthropic-version": "2023-06-01",
+        "Content-Type": "application/json",
+        "anthropic-beta": "oauth-2025-04-20",
+        "x-app": "cli",
+        "User-Agent": "claude-code/2.0.62"
+    };
+
+    if (activeAccessToken.startsWith("sk-ant-oat")) {
+        anthropicHeaders["Authorization"] = "Bearer " + activeAccessToken;
+    } else {
+        anthropicHeaders["x-api-key"] = activeAccessToken;
+    }
+
+    // 发送请求
+    var controller = new AbortController();
+    var timeoutId = setTimeout(function() { controller.abort(); }, 120000);
+
+    var response;
+    try {
+        response = await fetch("https://api.anthropic.com/v1/messages", {
+            method: "POST",
+            headers: anthropicHeaders,
+            body: JSON.stringify(anthropicReq),
+            signal: controller.signal
+        });
+    } catch (err) {
+        clearTimeout(timeoutId);
+        await recordKeyUsage(env, keyLabel, false);
+        var isTimeout = err.name === "AbortError";
+        return corsResponse(JSON.stringify({
+            error: isTimeout ? "Request timed out" : "Fetch error: " + err.message
+        }), isTimeout ? 504 : 502);
+    }
+    clearTimeout(timeoutId);
+
+    if (!response.ok) {
+        var errorBody = await response.text().catch(function() { return "Unknown"; });
+        console.error("[Anthropic] " + response.status + ": " + errorBody);
+        await recordKeyUsage(env, keyLabel, false);
+
+        // 如果是认证错误，通知 Telegram
+        if (response.status === 401 || response.status === 403) {
+            await sendTG(env,
+                "⚠️ <b>Key 认证失败</b>\n\n" +
+                "📛 Label: " + escHtml(keyLabel) + "\n" +
+                "状态码: " + response.status + "\n" +
+                "可能需要刷新，尝试 /refresh " + escHtml(keyLabel)
+            );
+        }
+
+        return new Response(errorBody, {
+            status: response.status,
+            headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+        });
+    }
+
+    // 成功，记录使用
+    await recordKeyUsage(env, keyLabel, true);
+
+    if (openaiReq.stream) {
+        return handleStream(response, requestedModel);
+    } else {
+        var data = await response.json();
+        return corsResponse(JSON.stringify(anthropicToOpenaiResp(data, requestedModel, "")));
+    }
+}
+
+// ================================================================
+// 流式处理
+// ================================================================
+
+function handleStream(anthropicResponse, model) {
+    var transformStream = new TransformStream();
+    var writer = transformStream.writable.getWriter();
+    var encoder = new TextEncoder();
+
+    var streamPromise = (async function() {
+        var reader = anthropicResponse.body.getReader();
+        var decoder = new TextDecoder();
+        var buffer = "";
+        var chatId = "chatcmpl-" + crypto.randomUUID();
+        var currentToolCallIndex = -1;
+
+        try {
+            while (true) {
+                var result = await reader.read();
+                if (result.done) break;
+
+                buffer += decoder.decode(result.value, { stream: true });
+                var lines = buffer.split("\n");
+                buffer = lines.pop();
+
+                for (var li = 0; li < lines.length; li++) {
+                    var line = lines[li];
+                    if (!line.startsWith("data: ")) continue;
+                    var dataStr = line.slice(6).trim();
+                    if (!dataStr || dataStr === "[DONE]") continue;
+
+                    try {
+                        var event = JSON.parse(dataStr);
+
+                        if (event.type === "message_start") {
+                            chatId = (event.message && event.message.id) || chatId;
+                            await writer.write(encoder.encode("data: " + JSON.stringify({
+                                id: chatId, object: "chat.completion.chunk",
+                                created: Math.floor(Date.now() / 1000), model: model,
+                                choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }]
+                            }) + "\n\n"));
+
+                        } else if (event.type === "content_block_start") {
+                            var block = event.content_block;
+                            if (block && block.type === "tool_use") {
+                                currentToolCallIndex++;
+                                await writer.write(encoder.encode("data: " + JSON.stringify({
+                                    id: chatId, object: "chat.completion.chunk",
+                                    created: Math.floor(Date.now() / 1000), model: model,
+                                    choices: [{
+                                        index: 0,
+                                        delta: {
+                                            tool_calls: [{
+                                                index: currentToolCallIndex,
+                                                id: block.id, type: "function",
+                                                function: { name: block.name, arguments: "" }
+                                            }]
+                                        },
+                                        finish_reason: null
+                                    }]
+                                }) + "\n\n"));
+                            }
+
+                        } else if (event.type === "content_block_delta") {
+                            if (event.delta && event.delta.type === "text_delta" && event.delta.text) {
+                                await writer.write(encoder.encode("data: " + JSON.stringify({
+                                    id: chatId, object: "chat.completion.chunk",
+                                    created: Math.floor(Date.now() / 1000), model: model,
+                                    choices: [{ index: 0, delta: { content: event.delta.text }, finish_reason: null }]
+                                }) + "\n\n"));
+                            } else if (event.delta && event.delta.type === "thinking_delta" && event.delta.thinking) {
+                                await writer.write(encoder.encode("data: " + JSON.stringify({
+                                    id: chatId, object: "chat.completion.chunk",
+                                    created: Math.floor(Date.now() / 1000), model: model,
+                                    choices: [{ index: 0, delta: { reasoning_content: event.delta.thinking }, finish_reason: null }]
+                                }) + "\n\n"));
+                            } else if (event.delta && event.delta.type === "input_json_delta" && event.delta.partial_json !== undefined) {
+                                await writer.write(encoder.encode("data: " + JSON.stringify({
+                                    id: chatId, object: "chat.completion.chunk",
+                                    created: Math.floor(Date.now() / 1000), model: model,
+                                    choices: [{
+                                        index: 0,
+                                        delta: {
+                                            tool_calls: [{
+                                                index: currentToolCallIndex,
+                                                function: { arguments: event.delta.partial_json }
+                                            }]
+                                        },
+                                        finish_reason: null
+                                    }]
+                                }) + "\n\n"));
+                            }
+
+                        } else if (event.type === "message_delta") {
+                            var chunk = {
+                                id: chatId, object: "chat.completion.chunk",
+                                created: Math.floor(Date.now() / 1000), model: model,
+                                choices: [{ index: 0, delta: {}, finish_reason: mapStopReason(event.delta && event.delta.stop_reason) }]
+                            };
+                            if (event.usage) {
+                                chunk.usage = {
+                                    prompt_tokens: event.usage.input_tokens || 0,
+                                    completion_tokens: event.usage.output_tokens || 0,
+                                    total_tokens: (event.usage.input_tokens || 0) + (event.usage.output_tokens || 0)
+                                };
+                            }
+                            await writer.write(encoder.encode("data: " + JSON.stringify(chunk) + "\n\n"));
+
+                        } else if (event.type === "message_stop") {
+                            await writer.write(encoder.encode("data: [DONE]\n\n"));
+
+                        } else if (event.type === "error") {
+                            console.error("[Stream Error]", JSON.stringify(event.error));
+                            await writer.write(encoder.encode("data: " + JSON.stringify({
+                                id: chatId, object: "chat.completion.chunk",
+                                created: Math.floor(Date.now() / 1000), model: model,
+                                choices: [{ index: 0, delta: { content: "\n[Error: " + ((event.error && event.error.message) || "Unknown") + "]" }, finish_reason: "stop" }]
+                            }) + "\n\n"));
+                            await writer.write(encoder.encode("data: [DONE]\n\n"));
+                        }
+                    } catch (parseErr) {
+                        console.error("[Stream Parse]", parseErr.message);
+                    }
+                }
+            }
+        } catch (err) {
+            console.error("[Stream]", err.message);
+        } finally {
+            try { await writer.close(); } catch (e) {}
+        }
+    })();
+
+    return new Response(transformStream.readable, {
+        headers: {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "Access-Control-Allow-Origin": "*"
+        }
+    });
+}
+
+// ================================================================
+// 入口 export
+// ================================================================
+
+export default {
+    async fetch(request, env, ctx) {
+        if (request.method === "OPTIONS") {
+            return new Response(null, {
+                status: 204,
+                headers: {
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+                    "Access-Control-Allow-Headers": "*",
+                }
+            });
+        }
+
+        var url = new URL(request.url);
+
+        try {
+            if (url.pathname === "/telegram/webhook" && request.method === "POST") {
+                return await handleTelegramWebhook(request, env);
+            }
+            if (url.pathname === "/v1/chat/completions" && request.method === "POST") {
+                return await handleChatCompletions(request, env);
+            }
+            if (url.pathname === "/v1/models" && request.method === "GET") {
+                return corsResponse(JSON.stringify({ object: "list", data: SUPPORTED_MODELS }));
+            }
+            if (url.pathname.startsWith("/admin/")) {
+                return await handleAdmin(url, request, env);
+            }
+            if (url.pathname === "/setup-webhook" && request.method === "GET") {
+                return await setupTelegramWebhook(url, env);
+            }
+            if (url.pathname === "/debug/version") {
+                return corsResponse(JSON.stringify({
+                    version: "3.0-loadbalance",
+                    features: ["custom-token-auth", "telegram-bot", "multi-key-lb", "auto-refresh"],
+                    models: Object.keys(MODEL_MAP)
+                }));
+            }
+
+            // 根路径返回简单说明
+            if (url.pathname === "/" || url.pathname === "") {
+                return corsResponse(JSON.stringify({
+                    service: "Claude API Proxy",
+                    status: "running",
+                    endpoints: {
+                        chat: "/v1/chat/completions",
+                        models: "/v1/models",
+                        version: "/debug/version"
+                    }
+                }));
+            }
+
+            return corsResponse(JSON.stringify({ error: "Not Found" }), 404);
+        } catch (err) {
+            console.error("[Global Error]", err.message, err.stack);
+            return new Response(JSON.stringify({ error: "Internal Server Error", detail: err.message }), {
+                status: 500,
+                headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+            });
+        }
+    },
+
+    async scheduled(event, env, ctx) {
+        console.log("[Cron] Triggered at", new Date().toISOString());
+        ctx.waitUntil(checkAndRefreshAllKeys(env));
+    }
+};
