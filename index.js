@@ -214,19 +214,24 @@ async function performTokenRefresh(refreshToken) {
         var body = JSON.stringify({
             grant_type: "refresh_token",
             refresh_token: refreshToken,
-            client_id: "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+            client_id: "9d1c250a-e61b-44d9-88ed-5944d1962f5e" // 这是目前已知的 Claude Code Client ID
         });
 
         console.log("[Refresh] Sending request to Anthropic...");
 
         var resp = await fetch("https://console.anthropic.com/v1/oauth/token", {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: { 
+                "Content-Type": "application/json",
+                "User-Agent": "claude-code/2.0.62", // 模拟官方 CLI
+                "Accept": "application/json"
+            },
             body: body
         });
 
         var respText = await resp.text();
         console.log("[Refresh] Status:", resp.status);
+        console.log("[Refresh] Response Body Preview:", respText.substring(0, 500)); // 打印返回内容前500字符
 
         if (!resp.ok) {
             console.error("[Refresh] HTTP Error:", resp.status, respText);
@@ -258,9 +263,11 @@ async function refreshSingleKey(env, keyData) {
         return { success: false, error: refreshed.error_detail };
     }
 
+    // 关键修改：如果缺失 access_token，把整个返回对象打印出来作为错误信息
     if (!refreshed.access_token) {
-        var debugInfo = JSON.stringify(refreshed).substring(0, 200);
-        return { success: false, error: "No access_token in response. Body: " + debugInfo };
+        var debugInfo = JSON.stringify(refreshed).substring(0, 300);
+        console.error("[Refresh] Missing access_token. Full response:", debugInfo);
+        return { success: false, error: "No access_token. Response: " + debugInfo };
     }
 
     var newExpiresAt = now + ((refreshed.expires_in || 3600) * 1000);
