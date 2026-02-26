@@ -1,5 +1,5 @@
 name = "claude-proxy"
-main = "src/index.js"
+main = "index.js"
 compatibility_date = "2025-06-27"
 compatibility_flags = ["nodejs_compat"]
 
