@@ -1,9 +1,19 @@
-name = "claudecode-toopenai"
-main = "index.js"
+name = "claude-proxy"
+main = "src/index.js"
 compatibility_date = "2025-06-27"
 compatibility_flags = ["nodejs_compat"]
 
-# 如果你需要 KV 存储（用于 token 缓存），取消下面的注释
-# [[kv_namespaces]]
-# binding = "TOKEN_CACHE"
-# id = "your-kv-namespace-id"
+# KV 存储
+#[[kv_namespaces]]
+#binding = "TOKEN_STORE"
+#id = "替换为你的KV_ID"
+
+# 每15分钟检查 token 过期
+[triggers]
+crons = ["*/15 * * * *"]
+
+# 在 Dashboard → Settings → Variables 中设置：
+# TELEGRAM_BOT_TOKEN = "你的Bot Token"
+# TELEGRAM_CHAT_ID = "群组ID"
+# CUSTOM_TOKENS = "mytoken1,mytoken2,secretkey3"  ← 自定义接入密码，逗号分隔
+# ADMIN_KEY = "管理密码"
