@@ -1,4 +1,4 @@
-name = "claude-proxy"
+name = "claudecode-toopenai"
 main = "index.js"
 compatibility_date = "2025-06-27"
 compatibility_flags = ["nodejs_compat"]
