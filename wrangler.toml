@@ -1,0 +1,9 @@
+name = "claude-openai-proxy"
+main = "index.js"
+compatibility_date = "2025-06-27"
+compatibility_flags = ["nodejs_compat"]
+
+# 如果你需要 KV 存储（用于 token 缓存），取消下面的注释
+# [[kv_namespaces]]
+# binding = "TOKEN_CACHE"
+# id = "your-kv-namespace-id"
