@@ -1,0 +1,12 @@
+name = "claude-proxy" # 你的 Worker 名字
+main = "index.js"     # 确保你的脚本文件名对应（如果是 src/index.js 请修改这里）
+compatibility_date = "2024-03-20"
+
+# 定时任务：每 10 分钟触发一次自动刷新检查
+[triggers]
+crons = ["*/10 * * * *"]
+
+# 绑定你的 KV 数据库（这里的 id 必须换成你自己在 Dashboard 创建的 KV 空间的 ID）
+[[kv_namespaces]]
+binding = "TOKEN_STORE"
+id = "claude" # 替换为真实的 KV ID
