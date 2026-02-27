@@ -1,5 +1,5 @@
 // ================================================================
-// Claude API 代理 v3.1 (修复版)
+// Claude API 代理 v3.2 (修复版 - 解决 401 死循环与刷新失败)
 // 功能：自定义Token鉴权 / Telegram Bot管理 / 多Key负载均衡 / 自动刷新 / 详细调试
 // ================================================================
 
@@ -192,7 +192,7 @@ async function incrementGlobalStats(env) {
 }
 
 // ================================================================
-// Token 刷新 (增强版调试)
+// Token 刷新 (增强版调试 + 修复版请求)
 // ================================================================
 
 async function refreshTokenWithLock(refreshToken) {
@@ -210,28 +210,27 @@ async function refreshTokenWithLock(refreshToken) {
 
 async function performTokenRefresh(refreshToken) {
     try {
-        // 构造请求体
-        var body = JSON.stringify({
-            grant_type: "refresh_token",
-            refresh_token: refreshToken,
-            client_id: "9d1c250a-e61b-44d9-88ed-5944d1962f5e" // 这是目前已知的 Claude Code Client ID
-        });
+        // 【修复点1】使用 application/x-www-form-urlencoded 标准格式发送 OAuth 请求
+        var body = new URLSearchParams();
+        body.append("grant_type", "refresh_token");
+        body.append("refresh_token", refreshToken);
+        body.append("client_id", "9d1c250a-e61b-44d9-88ed-5944d1962f5e"); // 已知的 Claude Code Client ID
 
         console.log("[Refresh] Sending request to Anthropic...");
 
         var resp = await fetch("https://console.anthropic.com/v1/oauth/token", {
             method: "POST",
             headers: { 
-                "Content-Type": "application/json",
-                "User-Agent": "claude-code/2.0.62", // 模拟官方 CLI
+                "Content-Type": "application/x-www-form-urlencoded", // 修正这里的 Content-Type
+                "User-Agent": "claude-code/2.0.62", 
                 "Accept": "application/json"
             },
-            body: body
+            body: body.toString()
         });
 
         var respText = await resp.text();
         console.log("[Refresh] Status:", resp.status);
-        console.log("[Refresh] Response Body Preview:", respText.substring(0, 500)); // 打印返回内容前500字符
+        console.log("[Refresh] Response Body Preview:", respText.substring(0, 500)); 
 
         if (!resp.ok) {
             console.error("[Refresh] HTTP Error:", resp.status, respText);
@@ -254,16 +253,20 @@ async function refreshSingleKey(env, keyData) {
     var now = Date.now();
     var refreshed = await refreshTokenWithLock(keyData.refreshToken);
 
-    // 检查是否有详细错误信息
     if (!refreshed) {
         return { success: false, error: "Refresh returned null (Network issue?)" };
     }
 
+    // 【修复点2】检测到 400 或 401 错误说明 Refresh Token 彻底失效，直接禁用该 Key
     if (refreshed.error_detail) {
+        if (refreshed.error_detail.includes("HTTP 401") || refreshed.error_detail.includes("HTTP 400")) {
+            keyData.enabled = false;
+            await saveKey(env, keyData.label, keyData);
+            return { success: false, error: refreshed.error_detail + "\n⚠️ (Refresh Token 已彻底失效，系统已自动禁用该 Key)" };
+        }
         return { success: false, error: refreshed.error_detail };
     }
 
-    // 关键修改：如果缺失 access_token，把整个返回对象打印出来作为错误信息
     if (!refreshed.access_token) {
         var debugInfo = JSON.stringify(refreshed).substring(0, 300);
         console.error("[Refresh] Missing access_token. Full response:", debugInfo);
@@ -963,14 +966,22 @@ async function handleChatCompletions(request, env) {
         console.error("[Anthropic] " + response.status + ": " + errorBody);
         await recordKeyUsage(env, keyLabel, false);
 
-        // 如果是认证错误，通知 Telegram
+        // 【修复点3】如果是认证错误，强制将该 key 的 expiresAt 设置为 0，防止死循环无限使用死 key
         if (response.status === 401 || response.status === 403) {
             await sendTG(env,
-                "⚠️ <b>Key 认证失败</b>\n\n" +
+                "⚠️ <b>Key 认证失败 (Token 可能已失效)</b>\n\n" +
                 "📛 Label: " + escHtml(keyLabel) + "\n" +
                 "状态码: " + response.status + "\n" +
-                "可能需要刷新，尝试 /refresh " + escHtml(keyLabel)
+                "系统已将该 Key 标记为强制过期，下次请求将自动尝试刷新或切换到其他 Key。"
             );
+            
+            try {
+                var failedKey = await getKey(env, keyLabel);
+                if (failedKey) {
+                    failedKey.expiresAt = 0; // 强制标记为已过期
+                    await saveKey(env, keyLabel, failedKey);
+                }
+            } catch(e) { console.error("Failed to expire key:", e); }
         }
 
         return new Response(errorBody, {
@@ -1169,7 +1180,7 @@ export default {
             }
             if (url.pathname === "/debug/version") {
                 return corsResponse(JSON.stringify({
-                    version: "3.1-loadbalance-debug",
+                    version: "3.2-fixed",
                     features: ["custom-token-auth", "telegram-bot", "multi-key-lb", "auto-refresh", "detail-errors"],
                     models: Object.keys(MODEL_MAP)
                 }));
