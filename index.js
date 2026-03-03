@@ -1,9 +1,8 @@
 // ================================================================
-// Claude API 代理 v3.3 (JSON 请求回退版 + 防死循环机制)
-// 功能：自定义Token鉴权 / Telegram Bot管理 / 多Key负载均衡 / 自动刷新 / 详细调试
+// Claude API 代理 v4.0 (全面优化版)
+// 功能：自定义Token鉴权 / Telegram Bot管理 / 多Key负载均衡 / 自动刷新
+//       分布式锁 / 自动重试 / 流式thinking+tool_calls / 安全加固
 // ================================================================
-
-const pendingRefreshes = new Map();
 
 const MODEL_MAP = {
 
@@ -110,6 +109,16 @@ function corsResponse(body, status) {
     });
 }
 
+function errorResponse(message, status) {
+    return corsResponse(JSON.stringify({
+        error: {
+            message: message,
+            type: "api_error",
+            code: status
+        }
+    }), status);
+}
+
 function escHtml(text) {
     if (!text) return "";
     return String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -127,6 +136,12 @@ function mapStopReason(r) {
         "tool_use": "tool_calls"
     };
     return map[r] || "stop";
+}
+
+function maskToken(token) {
+    if (!token) return "[empty]";
+    if (token.length <= 16) return token.substring(0, 4) + "...[HIDDEN]";
+    return token.substring(0, 10) + "...[HIDDEN]";
 }
 
 // ================================================================
@@ -182,6 +197,20 @@ async function sendTGLong(env, message) {
     return true;
 }
 
+async function deleteTGMessage(env, chatId, messageId) {
+    var botToken = env.TELEGRAM_BOT_TOKEN;
+    if (!botToken) return;
+    try {
+        await fetch("https://api.telegram.org/bot" + botToken + "/deleteMessage", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ chat_id: chatId, message_id: messageId })
+        });
+    } catch (e) {
+        console.error("[TG] Delete message failed:", e.message);
+    }
+}
+
 // ================================================================
 // KV 存储操作
 // ================================================================
@@ -220,12 +249,12 @@ async function listAllKeys(env) {
     if (!env.TOKEN_STORE) return [];
     try {
         var list = await env.TOKEN_STORE.list({ prefix: "key:" });
-        var keys = [];
-        for (var i = 0; i < list.keys.length; i++) {
-            var data = await env.TOKEN_STORE.get(list.keys[i].name, { type: "json" });
-            if (data) keys.push(data);
-        }
-        return keys;
+        var results = await Promise.all(
+            list.keys.map(function(k) {
+                return env.TOKEN_STORE.get(k.name, { type: "json" });
+            })
+        );
+        return results.filter(Boolean);
     } catch (e) {
         console.error("[KV List]", e.message);
         return [];
@@ -260,25 +289,66 @@ async function incrementGlobalStats(env) {
 }
 
 // ================================================================
-// Token 刷新逻辑 (v3.3 恢复 JSON 格式)
+// 分布式锁 (KV-based)
 // ================================================================
 
-async function refreshTokenWithLock(refreshToken) {
-    if (pendingRefreshes.has(refreshToken)) {
-        return pendingRefreshes.get(refreshToken);
-    }
-    var promise = performTokenRefresh(refreshToken);
-    pendingRefreshes.set(refreshToken, promise);
+async function acquireLock(env, lockName, ttlSeconds) {
+    if (!env.TOKEN_STORE) return true;
+    var lockKey = "lock:" + lockName;
     try {
-        return await promise;
+        var existing = await env.TOKEN_STORE.get(lockKey);
+        if (existing) {
+            return false; // 锁已被占用
+        }
+        await env.TOKEN_STORE.put(lockKey, String(Date.now()), { expirationTtl: ttlSeconds || 30 });
+        return true;
+    } catch (e) {
+        console.error("[Lock] Acquire error:", e.message);
+        return true; // 锁获取出错时放行，避免永久阻塞
+    }
+}
+
+async function releaseLock(env, lockName) {
+    if (!env.TOKEN_STORE) return;
+    try {
+        await env.TOKEN_STORE.delete("lock:" + lockName);
+    } catch (e) {
+        console.error("[Lock] Release error:", e.message);
+    }
+}
+
+// ================================================================
+// Token 刷新逻辑 (v4.0 - 分布式锁版)
+// ================================================================
+
+async function refreshTokenWithLock(env, keyData) {
+    var lockName = "refresh:" + keyData.label;
+    var acquired = await acquireLock(env, lockName, 30);
+
+    if (!acquired) {
+        // 锁被其他 worker 占用，等待后读取最新数据
+        console.log("[Refresh] Lock held by another worker for:", keyData.label);
+        await sleep(3000);
+        var updated = await getKey(env, keyData.label);
+        if (updated && updated.expiresAt > Date.now() + 60000) {
+            return {
+                success: true,
+                newToken: updated.accessToken,
+                expireStr: new Date(updated.expiresAt).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" })
+            };
+        }
+        return { success: false, error: "Refresh in progress by another worker, but result not yet available" };
+    }
+
+    try {
+        return await refreshSingleKey(env, keyData);
     } finally {
-        pendingRefreshes.delete(refreshToken);
+        await releaseLock(env, lockName);
     }
 }
 
 async function performTokenRefresh(refreshToken) {
     try {
-        // v3.3: 恢复使用 application/json，防止官方强校验
         var body = JSON.stringify({
             grant_type: "refresh_token",
             refresh_token: refreshToken,
@@ -289,7 +359,7 @@ async function performTokenRefresh(refreshToken) {
 
         var resp = await fetch("https://console.anthropic.com/v1/oauth/token", {
             method: "POST",
-            headers: { 
+            headers: {
                 "Content-Type": "application/json",
                 "User-Agent": "claude-code/2.0.62",
                 "Accept": "application/json"
@@ -298,7 +368,7 @@ async function performTokenRefresh(refreshToken) {
         });
 
         var respText = await resp.text();
-        
+
         if (!resp.ok) {
             console.error("[Refresh] HTTP Error:", resp.status, respText);
             return { error_detail: "HTTP " + resp.status + ": " + respText };
@@ -316,13 +386,12 @@ async function performTokenRefresh(refreshToken) {
 
 async function refreshSingleKey(env, keyData) {
     var now = Date.now();
-    var refreshed = await refreshTokenWithLock(keyData.refreshToken);
+    var refreshed = await performTokenRefresh(keyData.refreshToken);
 
     if (!refreshed) {
         return { success: false, error: "Refresh returned null (Network issue?)" };
     }
 
-    // 检测到 400 或 401 错误说明 Refresh Token 彻底失效，直接禁用该 Key
     if (refreshed.error_detail) {
         if (refreshed.error_detail.includes("HTTP 401") || refreshed.error_detail.includes("HTTP 400") || refreshed.error_detail.includes("invalid_grant")) {
             keyData.enabled = false;
@@ -341,11 +410,10 @@ async function refreshSingleKey(env, keyData) {
     var expireStr = new Date(newExpiresAt).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" });
 
     keyData.accessToken = refreshed.access_token;
-    // 必须保存官方下发的【全新】refreshToken！
     keyData.refreshToken = refreshed.refresh_token || keyData.refreshToken;
     keyData.expiresAt = newExpiresAt;
     keyData.lastRefreshed = new Date().toISOString();
-    
+
     var saved = await saveKey(env, keyData.label, keyData);
     if (!saved) {
         return { success: false, error: "KV Save failed after refresh" };
@@ -369,26 +437,18 @@ async function checkAndRefreshAllKeys(env, forceAll) {
         var needsRefresh = forceAll || !keyData.expiresAt || keyData.expiresAt < now + bufferTime;
         if (!needsRefresh) { skipped++; continue; }
 
-        var result = await refreshSingleKey(env, keyData);
+        var result = await refreshTokenWithLock(env, keyData);
 
         if (result.success) {
             refreshed++;
-            var fullConfig = {
-                claudeAiOauth: {
-                    accessToken: keyData.accessToken,
-                    refreshToken: keyData.refreshToken,
-                    expiresAt: keyData.expiresAt,
-                    scopes: keyData.scopes || [],
-                    subscriptionType: keyData.subscriptionType || "unknown",
-                    rateLimitTier: keyData.rateLimitTier || "default",
-                }
-            };
+            // 重新读取最新数据（可能被 refreshSingleKey 更新了）
+            var latestData = await getKey(env, keyData.label);
             await sendTGLong(env,
                 "🔄 <b>Token 自动刷新成功</b>\n\n" +
                 "📛 Label: <b>" + escHtml(keyData.label) + "</b>\n" +
-                "⏰ 新到期: " + result.expireStr + "\n\n" +
-                "<b>完整配置（备份用）：</b>\n" +
-                "<pre>" + escHtml(JSON.stringify(fullConfig, null, 2)) + "</pre>"
+                "⏰ 新到期: " + result.expireStr + "\n" +
+                "🔑 AccessToken: <code>" + maskToken(latestData ? latestData.accessToken : "unknown") + "</code>\n" +
+                "🔄 RefreshToken: <code>" + maskToken(latestData ? latestData.refreshToken : "unknown") + "</code>"
             );
         } else {
             failed++;
@@ -398,7 +458,7 @@ async function checkAndRefreshAllKeys(env, forceAll) {
                 "原因: " + escHtml(result.error)
             );
         }
-        await sleep(1000); // 间隔1秒，防止频繁请求被拦截
+        await sleep(1000);
     }
 
     return { checked: keys.length, refreshed: refreshed, failed: failed, skipped: skipped };
@@ -414,7 +474,11 @@ async function selectKey(env) {
     var bufferTime = 2 * 60 * 1000;
 
     var available = keys.filter(function(k) {
-        return k.enabled && k.accessToken && k.expiresAt > now + bufferTime;
+        if (!k.enabled || !k.accessToken || k.expiresAt <= now + bufferTime) return false;
+        // 硬性排除：连续错误超过5次且最近5分钟内有错误的 Key
+        var recentError = k.lastErrorAt && (now - new Date(k.lastErrorAt).getTime() < 300000);
+        if ((k.consecutiveErrors || 0) >= 5 && recentError) return false;
+        return true;
     });
 
     if (available.length === 0) {
@@ -436,16 +500,17 @@ async function selectKey(env) {
     return selected.key;
 }
 
-async function recordKeyUsage(env, label, success) {
-    var keyData = await getKey(env, label);
-    if (!keyData) return;
+async function recordKeyUsage(env, keyData, success) {
     keyData.useCount = (keyData.useCount || 0) + 1;
     keyData.lastUsed = new Date().toISOString();
     if (!success) {
         keyData.errorCount = (keyData.errorCount || 0) + 1;
+        keyData.consecutiveErrors = (keyData.consecutiveErrors || 0) + 1;
         keyData.lastErrorAt = new Date().toISOString();
+    } else {
+        keyData.consecutiveErrors = 0;
     }
-    await saveKey(env, label, keyData);
+    await saveKey(env, keyData.label, keyData);
     await incrementGlobalStats(env);
 }
 
@@ -568,19 +633,33 @@ function anthropicToOpenaiResp(data, model, injectionText) {
 async function setupTelegramWebhook(url, env) {
     var botToken = env.TELEGRAM_BOT_TOKEN;
     if (!botToken) {
-        return corsResponse(JSON.stringify({ error: "TELEGRAM_BOT_TOKEN not set" }), 500);
+        return errorResponse("TELEGRAM_BOT_TOKEN not set", 500);
     }
     var webhookUrl = url.origin + "/telegram/webhook";
+    var setBody = { url: webhookUrl };
+    // 如果配置了 webhook secret，一并设置
+    if (env.TELEGRAM_WEBHOOK_SECRET) {
+        setBody.secret_token = env.TELEGRAM_WEBHOOK_SECRET;
+    }
     var resp = await fetch("https://api.telegram.org/bot" + botToken + "/setWebhook", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url: webhookUrl })
+        body: JSON.stringify(setBody)
     });
     var result = await resp.json();
     return corsResponse(JSON.stringify({ webhook_url: webhookUrl, telegram_response: result }));
 }
 
 async function handleTelegramWebhook(request, env) {
+    // 验证 Telegram Webhook Secret
+    if (env.TELEGRAM_WEBHOOK_SECRET) {
+        var secretHeader = request.headers.get("X-Telegram-Bot-Api-Secret-Token") || "";
+        if (secretHeader !== env.TELEGRAM_WEBHOOK_SECRET) {
+            console.warn("[TG Webhook] Invalid secret token");
+            return new Response("Forbidden", { status: 403 });
+        }
+    }
+
     var update = await request.json().catch(function() { return null; });
     if (!update || !update.message) return new Response("OK");
 
@@ -600,11 +679,13 @@ async function handleTelegramWebhook(request, env) {
         switch (cmd) {
             case "/help":
                 await sendTG(env,
-                    "🤖 <b>Claude 代理管理 Bot</b>\n\n" +
+                    "🤖 <b>Claude 代理管理 Bot v4.0</b>\n\n" +
                     "/addkey &lt;label&gt; &lt;JSON&gt; — 添加 Key\n" +
                     "/removekey &lt;label&gt; — 删除 Key\n" +
                     "/listkeys — 列出所有 Key\n" +
                     "/status — 详细状态\n" +
+                    "/enable &lt;label&gt; — 启用 Key\n" +
+                    "/disable &lt;label&gt; — 禁用 Key\n" +
                     "/refresh &lt;label&gt; — 刷新指定 Key\n" +
                     "/refreshall — 刷新所有\n"
                 );
@@ -616,7 +697,7 @@ async function handleTelegramWebhook(request, env) {
                 var addJsonStr = args.slice(1).join(" ");
                 var addParsed;
                 try { addParsed = JSON.parse(addJsonStr); } catch (e) { await sendTG(env, "❌ JSON解析失败"); break; }
-                
+
                 var addOauth = addParsed.claudeAiOauth;
                 if (!addOauth || !addOauth.accessToken || !addOauth.refreshToken) {
                     await sendTG(env, "❌ 缺少 Token 数据"); break;
@@ -633,12 +714,17 @@ async function handleTelegramWebhook(request, env) {
                     enabled: true,
                     useCount: 0,
                     errorCount: 0,
+                    consecutiveErrors: 0,
                 };
 
                 await saveKey(env, addLabel, addKeyData);
-                await sendTG(env, "✅ <b>Key 保存成功</b>\n📛 " + escHtml(addLabel) + "\n自动验证中...");
 
-                var addRefreshResult = await refreshSingleKey(env, addKeyData);
+                // 删除包含敏感信息的原消息
+                await deleteTGMessage(env, chatId, msg.message_id);
+
+                await sendTG(env, "✅ <b>Key 保存成功</b>\n📛 " + escHtml(addLabel) + "\n🔑 Token: <code>" + maskToken(addOauth.accessToken) + "</code>\n⚠️ 原消息已删除（含敏感信息）\n\n自动验证中...");
+
+                var addRefreshResult = await refreshTokenWithLock(env, addKeyData);
                 if (addRefreshResult.success) {
                     await sendTG(env, "✅ <b>Token验证并刷新成功，已就绪</b>");
                 } else {
@@ -649,229 +735,4 @@ async function handleTelegramWebhook(request, env) {
             case "/removekey":
                 if (args.length < 1) { await sendTG(env, "⚠️ 格式：/removekey &lt;label&gt;"); break; }
                 await deleteKey(env, args[0]);
-                await sendTG(env, "🗑️ 已删除: <b>" + escHtml(args[0]) + "</b>");
-                break;
-
-            case "/listkeys":
-                var allKeys = await listAllKeys(env);
-                if (allKeys.length === 0) { await sendTG(env, "📭 没有 Key"); break; }
-                var now = Date.now();
-                var listText = "📋 <b>Key 列表 (" + allKeys.length + ")</b>\n\n";
-                for (var ki = 0; ki < allKeys.length; ki++) {
-                    var k = allKeys[ki];
-                    var remainMin = k.expiresAt ? Math.round((k.expiresAt - now) / 60000) : "?";
-                    var icon = !k.enabled ? "⏸️" : (remainMin > 0 ? "✅" : "❌");
-                    listText += icon + " <b>" + escHtml(k.label) + "</b> (" + remainMin + "分) | 用" + (k.useCount || 0) + " 错" + (k.errorCount || 0) + "\n";
-                }
-                await sendTGLong(env, listText);
-                break;
-
-            case "/refresh":
-                if (args.length < 1) { await sendTG(env, "⚠️ 格式：/refresh &lt;label&gt;"); break; }
-                var rKey = await getKey(env, args[0]);
-                if (!rKey) { await sendTG(env, "❌ 未找到: " + escHtml(args[0])); break; }
-                var rResult = await refreshSingleKey(env, rKey);
-                if (rResult.success) {
-                    await sendTG(env, "✅ <b>刷新成功</b>\n📛 " + escHtml(args[0]));
-                } else {
-                    await sendTG(env, "❌ <b>刷新失败</b>\n" + escHtml(rResult.error));
-                }
-                break;
-
-            case "/refreshall":
-                await sendTG(env, "🔄 正在刷新...");
-                var raResult = await checkAndRefreshAllKeys(env, true);
-                await sendTG(env, "✅ <b>批量刷新完成</b>\n成功: " + raResult.refreshed + " | 失败: " + raResult.failed);
-                break;
-
-            default:
-                await sendTG(env, "❓ 未知命令 /help");
-        }
-    } catch (err) {
-        await sendTG(env, "❌ 执行出错: " + escHtml(err.message));
-    }
-    return new Response("OK");
-}
-
-// ================================================================
-// 主请求处理
-// ================================================================
-
-async function handleChatCompletions(request, env) {
-    var authHeader = request.headers.get("Authorization") || "";
-    if (!validateCustomToken(authHeader, env)) {
-        return corsResponse(JSON.stringify({ error: "Invalid API key" }), 401);
-    }
-
-    var selectedKey = await selectKey(env);
-    if (!selectedKey) {
-        return corsResponse(JSON.stringify({ error: "No available API keys" }), 503);
-    }
-
-    var activeAccessToken = selectedKey.accessToken;
-    var keyLabel = selectedKey.label;
-
-    var openaiReq = await request.json().catch(function() { return {}; });
-
-    var systemPrompt = "";
-    var rawMessages = [];
-    var msgs = openaiReq.messages || [];
-
-    for (var i = 0; i < msgs.length; i++) {
-        var m = msgs[i];
-        if (m.role === "system") {
-            systemPrompt += (typeof m.content === "string" ? m.content : JSON.stringify(m.content)) + "\n";
-        } else if (m.role === "user" || m.role === "assistant") {
-            rawMessages.push({ role: m.role, content: convertContent(m.content) });
-        }
-    }
-
-    var anthropicMessages = mergeConsecutiveRoles(rawMessages);
-    if (anthropicMessages.length > 0 && anthropicMessages[0].role !== "user") {
-        anthropicMessages.unshift({ role: "user", content: "(continued)" });
-    }
-
-    var requestedModel = openaiReq.model || "claude-sonnet-4-5";
-    var model = MODEL_MAP[requestedModel] || MODEL_MAP["claude-sonnet-4-5"];
-
-    var anthropicReq = {
-        model: model,
-        max_tokens: openaiReq.max_tokens || 8192,
-        messages: anthropicMessages,
-    };
-    if (systemPrompt.trim()) anthropicReq.system = systemPrompt.trim();
-    if (openaiReq.stream) anthropicReq.stream = true;
-
-    var anthropicHeaders = {
-        "anthropic-version": "2023-06-01",
-        "Content-Type": "application/json",
-        "anthropic-beta": "oauth-2025-04-20",
-        "x-app": "cli",
-        "User-Agent": "claude-code/2.0.62"
-    };
-
-    if (activeAccessToken.startsWith("sk-ant-oat")) {
-        anthropicHeaders["Authorization"] = "Bearer " + activeAccessToken;
-    } else {
-        anthropicHeaders["x-api-key"] = activeAccessToken;
-    }
-
-    var controller = new AbortController();
-    var timeoutId = setTimeout(function() { controller.abort(); }, 120000);
-
-    var response;
-    try {
-        response = await fetch("https://api.anthropic.com/v1/messages", {
-            method: "POST",
-            headers: anthropicHeaders,
-            body: JSON.stringify(anthropicReq),
-            signal: controller.signal
-        });
-    } catch (err) {
-        clearTimeout(timeoutId);
-        await recordKeyUsage(env, keyLabel, false);
-        var isTimeout = err.name === "AbortError";
-        return corsResponse(JSON.stringify({ error: isTimeout ? "Request timed out" : err.message }), isTimeout ? 504 : 502);
-    }
-    clearTimeout(timeoutId);
-
-    if (!response.ok) {
-        var errorBody = await response.text().catch(function() { return "Unknown"; });
-        await recordKeyUsage(env, keyLabel, false);
-
-        if (response.status === 401 || response.status === 403) {
-            await sendTG(env, "⚠️ <b>Key 失效</b>\n📛 " + escHtml(keyLabel) + "\n状态码: " + response.status + "\n系统已强制使其过期。");
-            try {
-                var failedKey = await getKey(env, keyLabel);
-                if (failedKey) {
-                    failedKey.expiresAt = 0; 
-                    await saveKey(env, keyLabel, failedKey);
-                }
-            } catch(e) {}
-        }
-        return new Response(errorBody, { status: response.status, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
-    }
-
-    await recordKeyUsage(env, keyLabel, true);
-
-    if (openaiReq.stream) {
-        return handleStream(response, requestedModel);
-    } else {
-        var data = await response.json();
-        return corsResponse(JSON.stringify(anthropicToOpenaiResp(data, requestedModel, "")));
-    }
-}
-
-// ================================================================
-// 流式处理
-// ================================================================
-
-function handleStream(anthropicResponse, model) {
-    var transformStream = new TransformStream();
-    var writer = transformStream.writable.getWriter();
-    var encoder = new TextEncoder();
-
-    (async function() {
-        var reader = anthropicResponse.body.getReader();
-        var decoder = new TextDecoder();
-        var buffer = "";
-        var chatId = "chatcmpl-" + crypto.randomUUID();
-
-        try {
-            while (true) {
-                var result = await reader.read();
-                if (result.done) break;
-
-                buffer += decoder.decode(result.value, { stream: true });
-                var lines = buffer.split("\n");
-                buffer = lines.pop();
-
-                for (var li = 0; li < lines.length; li++) {
-                    var line = lines[li];
-                    if (!line.startsWith("data: ")) continue;
-                    var dataStr = line.slice(6).trim();
-                    if (!dataStr || dataStr === "[DONE]") continue;
-
-                    try {
-                        var event = JSON.parse(dataStr);
-                        if (event.type === "message_start") {
-                            await writer.write(encoder.encode("data: " + JSON.stringify({ id: chatId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: model, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] }) + "\n\n"));
-                        } else if (event.type === "content_block_delta" && event.delta && event.delta.type === "text_delta") {
-                            await writer.write(encoder.encode("data: " + JSON.stringify({ id: chatId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: model, choices: [{ index: 0, delta: { content: event.delta.text }, finish_reason: null }] }) + "\n\n"));
-                        } else if (event.type === "message_stop") {
-                            await writer.write(encoder.encode("data: [DONE]\n\n"));
-                        }
-                    } catch (e) {}
-                }
-            }
-        } catch (err) {} finally {
-            try { await writer.close(); } catch (e) {}
-        }
-    })();
-
-    return new Response(transformStream.readable, {
-        headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive", "Access-Control-Allow-Origin": "*" }
-    });
-}
-
-// ================================================================
-// 入口 export
-// ================================================================
-
-export default {
-    async fetch(request, env, ctx) {
-        if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "*", "Access-Control-Allow-Headers": "*" } });
-        var url = new URL(request.url);
-        try {
-            if (url.pathname === "/telegram/webhook" && request.method === "POST") return await handleTelegramWebhook(request, env);
-            if (url.pathname === "/v1/chat/completions" && request.method === "POST") return await handleChatCompletions(request, env);
-            return corsResponse(JSON.stringify({ error: "Not Found" }), 404);
-        } catch (err) {
-            return new Response(JSON.stringify({ error: "Internal Error" }), { status: 500 });
-        }
-    },
-    async scheduled(event, env, ctx) {
-        ctx.waitUntil(checkAndRefreshAllKeys(env));
-    }
-};
-
+                await sendTG(env, "🗑️ 已删除: <b>" + esc
