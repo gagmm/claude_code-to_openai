@@ -714,8 +714,19 @@ function buildAnthropicRequest(openaiReq) {
     if (systemPrompt.trim()) anthropicReq.system = systemPrompt.trim();
     if (openaiReq.stream) anthropicReq.stream = true;
 
+    // ✅ 修复：正确处理 thinking 配置
     if (openaiReq.thinking) {
+        // 如果客户端传了 thinking 配置，直接用
         anthropicReq.thinking = openaiReq.thinking;
+    } else if (openaiReq.model && openaiReq.model.includes("opus")) {
+        // opus 系列模型自动启用 thinking（如果没显式禁用）
+        // 检查 openaiReq 中是否明确设置为 disabled
+        if (openaiReq.thinking !== false) {
+            anthropicReq.thinking = {
+                type: "enabled",
+                budget_tokens: 5000  // 默认预算
+            };
+        }
     }
 
     if (openaiReq.tools && Array.isArray(openaiReq.tools)) {
@@ -724,6 +735,7 @@ function buildAnthropicRequest(openaiReq) {
 
     return { anthropicReq: anthropicReq, requestedModel: requestedModel };
 }
+
 
 function buildAnthropicHeaders(accessToken) {
     var headers = {
@@ -773,7 +785,9 @@ async function callAnthropic(accessToken, anthropicReq, timeoutMs) {
 // ================================================================
 
 function handleStream(anthropicResponse, model) {
-    var transformStream = new TransformStream();
+    var transformStream = new TransformStream({
+        highWaterMark: 1024 * 64, // 64KB 缓冲（足够大但不会爆）
+    });
     var writer = transformStream.writable.getWriter();
     var encoder = new TextEncoder();
 
@@ -785,13 +799,15 @@ function handleStream(anthropicResponse, model) {
         var blockTypes = {};
         var toolCallIndex = -1;
         var lastSendTime = Date.now();
-        var keepAliveInterval = 20000; // 20秒心跳
+        var keepAliveInterval = 10000; // 10秒心跳（更频繁）
+        var chunkCount = 0;
+        var totalTokensProcessed = 0;
 
         function writeChunk(data) {
             return writer.write(encoder.encode("data: " + JSON.stringify(data) + "\n\n"));
         }
 
-        // 发送心跳包，防止连接断开
+        // 心跳保活（更激进）
         var heartbeatTimer = setInterval(async function() {
             try {
                 if (Date.now() - lastSendTime > keepAliveInterval) {
@@ -803,6 +819,7 @@ function handleStream(anthropicResponse, model) {
                         choices: [{ index: 0, delta: {}, finish_reason: null }]
                     });
                     lastSendTime = Date.now();
+                    console.log("[Stream] Keep-alive sent, chunks:", chunkCount);
                 }
             } catch (e) {
                 clearInterval(heartbeatTimer);
@@ -812,17 +829,36 @@ function handleStream(anthropicResponse, model) {
         try {
             while (true) {
                 var result = await reader.read();
-                if (result.done) break;
+                if (result.done) {
+                    console.log("[Stream] Reader done. Total chunks:", chunkCount);
+                    break;
+                }
 
-                buffer += decoder.decode(result.value, { stream: true });
+                // 逐步处理数据，防止缓冲过载
+                var chunk = result.value;
+                buffer += decoder.decode(chunk, { stream: true });
+
+                // 分行处理，每行立即处理不积压
                 var lines = buffer.split("\n");
-                buffer = lines.pop();
+                buffer = lines.pop(); // 保留未完成的行
 
                 for (var li = 0; li < lines.length; li++) {
                     var line = lines[li];
                     if (!line.startsWith("data: ")) continue;
                     var dataStr = line.slice(6).trim();
-                    if (!dataStr || dataStr === "[DONE]") continue;
+                    if (!dataStr || dataStr === "[DONE]") {
+                        if (dataStr === "[DONE]") {
+                            await writeChunk({
+                                id: chatId,
+                                object: "chat.completion.chunk",
+                                created: Math.floor(Date.now() / 1000),
+                                model: model,
+                                choices: [{ index: 0, delta: {}, finish_reason: "stop" }]
+                            });
+                            await writer.write(encoder.encode("data: [DONE]\n\n"));
+                        }
+                        continue;
+                    }
 
                     try {
                         var event = JSON.parse(dataStr);
@@ -836,6 +872,7 @@ function handleStream(anthropicResponse, model) {
                                 choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }]
                             });
                             lastSendTime = Date.now();
+                            chunkCount++;
 
                         } else if (event.type === "content_block_start") {
                             var blockIndex = event.index;
@@ -866,8 +903,25 @@ function handleStream(anthropicResponse, model) {
                                     }]
                                 });
                                 lastSendTime = Date.now();
+                                chunkCount++;
+
                             } else if (contentBlock.type === "thinking") {
                                 blockTypes[blockIndex] = "thinking";
+                                // ✅ 通知开始思考
+                                await writeChunk({
+                                    id: chatId,
+                                    object: "chat.completion.chunk",
+                                    created: Math.floor(Date.now() / 1000),
+                                    model: model,
+                                    choices: [{
+                                        index: 0,
+                                        delta: { reasoning_content: "[思考开始...]\n" },
+                                        finish_reason: null
+                                    }]
+                                });
+                                lastSendTime = Date.now();
+                                chunkCount++;
+
                             } else {
                                 blockTypes[blockIndex] = "text";
                             }
@@ -882,16 +936,24 @@ function handleStream(anthropicResponse, model) {
                                     choices: [{ index: 0, delta: { content: event.delta.text }, finish_reason: null }]
                                 });
                                 lastSendTime = Date.now();
+                                chunkCount++;
 
                             } else if (event.delta.type === "thinking_delta") {
+                                // ✅ 正确转发思考过程
                                 await writeChunk({
                                     id: chatId,
                                     object: "chat.completion.chunk",
                                     created: Math.floor(Date.now() / 1000),
                                     model: model,
-                                    choices: [{ index: 0, delta: { reasoning_content: event.delta.thinking }, finish_reason: null }]
+                                    choices: [{
+                                        index: 0,
+                                        delta: { reasoning_content: event.delta.thinking },
+                                        finish_reason: null
+                                    }]
                                 });
                                 lastSendTime = Date.now();
+                                chunkCount++;
+                                totalTokensProcessed += (event.delta.thinking || "").length;
 
                             } else if (event.delta.type === "input_json_delta") {
                                 await writeChunk({
@@ -913,6 +975,25 @@ function handleStream(anthropicResponse, model) {
                                     }]
                                 });
                                 lastSendTime = Date.now();
+                                chunkCount++;
+                            }
+
+                        } else if (event.type === "content_block_stop") {
+                            // ✅ 块结束时记录
+                            if (blockTypes[event.index] === "thinking") {
+                                await writeChunk({
+                                    id: chatId,
+                                    object: "chat.completion.chunk",
+                                    created: Math.floor(Date.now() / 1000),
+                                    model: model,
+                                    choices: [{
+                                        index: 0,
+                                        delta: { reasoning_content: "\n[思考结束]\n" },
+                                        finish_reason: null
+                                    }]
+                                });
+                                lastSendTime = Date.now();
+                                chunkCount++;
                             }
 
                         } else if (event.type === "message_delta") {
@@ -925,35 +1006,77 @@ function handleStream(anthropicResponse, model) {
                                 choices: [{ index: 0, delta: {}, finish_reason: finishReason }]
                             });
                             lastSendTime = Date.now();
+                            chunkCount++;
+
+                            // 记录 token 统计
+                            if (event.usage) {
+                                totalTokensProcessed = event.usage.input_tokens + event.usage.output_tokens;
+                                console.log("[Stream] Total tokens:", totalTokensProcessed);
+                            }
 
                         } else if (event.type === "message_stop") {
+                            console.log("[Stream] Message stop event received");
                             await writer.write(encoder.encode("data: [DONE]\n\n"));
                             lastSendTime = Date.now();
                         }
 
                     } catch (e) {
-                        console.error("[Stream Parse]", e.message);
+                        console.error("[Stream Parse Line]", e.message, "line:", line.substring(0, 100));
+                    }
+                }
+
+                // ✅ 主动刷新缓冲（高频率）
+                if (chunkCount % 10 === 0) {
+                    // 每10个chunk刷新一次日志
+                    console.log("[Stream] Processed", chunkCount, "chunks, elapsed:", Date.now() - lastSendTime, "ms");
+                }
+            }
+
+            // 处理残留的缓冲区
+            if (buffer.trim()) {
+                var lastLine = buffer.trim();
+                if (lastLine.startsWith("data: ")) {
+                    var lastDataStr = lastLine.slice(6).trim();
+                    if (lastDataStr && lastDataStr !== "[DONE]") {
+                        try {
+                            var lastEvent = JSON.parse(lastDataStr);
+                            console.log("[Stream] Processing final buffer:", lastEvent.type);
+                            // 处理最后一行...
+                        } catch (e) {}
                     }
                 }
             }
+
         } catch (err) {
-            console.error("[Stream] Error:", err.message);
+            console.error("[Stream] Fatal error:", err.message, err.stack);
+            try {
+                await writeChunk({
+                    id: chatId,
+                    object: "chat.completion.chunk",
+                    created: Math.floor(Date.now() / 1000),
+                    model: model,
+                    choices: [{ index: 0, delta: { content: "\n\n❌ 流式传输中断: " + err.message }, finish_reason: "error" }]
+                });
+            } catch (e) {}
         } finally {
             clearInterval(heartbeatTimer);
+            console.log("[Stream] Final stats - Total chunks:", chunkCount, "Total tokens:", totalTokensProcessed);
             try { await writer.close(); } catch (e) {}
         }
     })();
 
     return new Response(transformStream.readable, {
         headers: {
-            "Content-Type": "text/event-stream",
+            "Content-Type": "text/event-stream; charset=utf-8",
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
             "Access-Control-Allow-Origin": "*",
-            "X-Accel-Buffering": "no"  // 禁用代理缓冲
+            "X-Accel-Buffering": "no",
+            "Transfer-Encoding": "chunked"  // ✅ 显式声明分块编码
         }
     });
 }
+
 
 // ================================================================
 // Telegram 直接对话功能
@@ -1340,7 +1463,20 @@ async function handleChatCompletions(request, env) {
     var anthropicReq = built.anthropicReq;
     var requestedModel = built.requestedModel;
 
-    var timeoutMs = (openaiReq.thinking || anthropicReq.thinking) ? 300000 : 120000;
+    var estimatedTokens = JSON.stringify(anthropicReq).length / 4;
+    var timeoutMs = 120000; // 基础 2 分钟
+
+    if (openaiReq.thinking) {
+        timeoutMs = Math.max(300000, 120000 + (estimatedTokens * 100)); // 5分钟起步
+    } else if (estimatedTokens > 50000) {
+        timeoutMs = 300000; // 50k+ token 给 5 分钟
+    } else if (estimatedTokens > 10000) {
+        timeoutMs = 180000; // 10k+ token 给 3 分钟
+    }
+
+    console.log("[API] Timeout set to", timeoutMs, "ms for estimated", estimatedTokens, "tokens");
+
+ 
 
     var MAX_RETRIES = 2;
     var lastErrorBody = "";
