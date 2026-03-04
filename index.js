@@ -1,54 +1,40 @@
 // ================================================================
-// Claude API 代理 v4.0 (全面优化版)
+// Claude API 代理 v4.1 (完整版)
 // 功能：自定义Token鉴权 / Telegram Bot管理 / 多Key负载均衡 / 自动刷新
 //       分布式锁 / 自动重试 / 流式thinking+tool_calls / 安全加固
+//       Telegram 直接对话 / 会话管理 / 连接保活
 // ================================================================
 
 const MODEL_MAP = {
-
   "claude-opus-4-6": "claude-opus-4-6",
   "claude-opus-4-6-latest": "claude-opus-4-6",
-
   "claude-sonnet-4-5": "claude-sonnet-4-5-20250929",
   "claude-sonnet-4-5-20250929": "claude-sonnet-4-5-20250929",
-
   "claude-haiku-4-5": "claude-haiku-4-5-20251001",
   "claude-haiku-4-5-20251001": "claude-haiku-4-5-20251001",
-
   "claude-opus-4-5": "claude-opus-4-5-20251101",
   "claude-opus-4-5-20251101": "claude-opus-4-5-20251101",
-
   "claude-opus-4-1": "claude-opus-4-1-20250805",
   "claude-opus-4-1-20250805": "claude-opus-4-1-20250805",
-
   "claude-opus-4-0": "claude-opus-4-20250514",
   "claude-opus-4-20250514": "claude-opus-4-20250514",
-
   "claude-sonnet-4-0": "claude-sonnet-4-20250514",
   "claude-sonnet-4-20250514": "claude-sonnet-4-20250514",
-
   "claude-3-7-sonnet": "claude-3-7-sonnet-20250219",
   "claude-3-7-sonnet-latest": "claude-3-7-sonnet-20250219",
   "claude-3-7-sonnet-20250219": "claude-3-7-sonnet-20250219",
-
   "claude-3-5-sonnet": "claude-3-5-sonnet-20241022",
   "claude-3-5-sonnet-20241022": "claude-3-5-sonnet-20241022",
-
   "claude-3-5-haiku": "claude-3-5-haiku-20241022",
   "claude-3-5-haiku-20241022": "claude-3-5-haiku-20241022",
-
   "claude-3-opus": "claude-3-opus-20240229",
   "claude-3-opus-20240229": "claude-3-opus-20240229",
-
   "claude-3-haiku": "claude-3-haiku-20240307",
   "claude-3-haiku-20240307": "claude-3-haiku-20240307",
-
   "claude-2.1": "claude-2-1",
   "claude-2-1": "claude-2-1",
-
   "claude-2.0": "claude-2-0",
   "claude-2-0": "claude-2-0",
-
   "claude-instant-1.2": "claude-instant-1-2",
   "claude-instant-1-2": "claude-instant-1-2"
 };
@@ -162,6 +148,32 @@ async function sendTGLong(env, message) {
     return true;
 }
 
+async function sendTGReply(env, chatId, message, replyToMessageId) {
+    var botToken = env.TELEGRAM_BOT_TOKEN;
+    if (!botToken) return { ok: false, error: "No bot token" };
+    try {
+        var body = {
+            chat_id: chatId,
+            text: message,
+            parse_mode: "HTML",
+            disable_web_page_preview: true
+        };
+        if (replyToMessageId) {
+            body.reply_to_message_id = replyToMessageId;
+        }
+        var resp = await fetch("https://api.telegram.org/bot" + botToken + "/sendMessage", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body)
+        });
+        if (!resp.ok) return { ok: false, error: await resp.text() };
+        var result = await resp.json();
+        return { ok: true, messageId: result.result.message_id };
+    } catch (err) {
+        return { ok: false, error: err.message };
+    }
+}
+
 async function deleteTGMessage(env, chatId, messageId) {
     var botToken = env.TELEGRAM_BOT_TOKEN;
     if (!botToken) return;
@@ -173,6 +185,28 @@ async function deleteTGMessage(env, chatId, messageId) {
         });
     } catch (e) {
         console.error("[TG] Delete message failed:", e.message);
+    }
+}
+
+async function editTGMessage(env, chatId, messageId, newText) {
+    var botToken = env.TELEGRAM_BOT_TOKEN;
+    if (!botToken) return false;
+    try {
+        var resp = await fetch("https://api.telegram.org/bot" + botToken + "/editMessageText", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                chat_id: chatId,
+                message_id: messageId,
+                text: newText,
+                parse_mode: "HTML",
+                disable_web_page_preview: true
+            })
+        });
+        return resp.ok;
+    } catch (e) {
+        console.error("[TG] Edit message failed:", e.message);
+        return false;
     }
 }
 
@@ -254,6 +288,39 @@ async function incrementGlobalStats(env) {
 }
 
 // ================================================================
+// Telegram 会话管理
+// ================================================================
+
+async function getTGSession(env, chatId) {
+    if (!env.TOKEN_STORE) return null;
+    try {
+        return await env.TOKEN_STORE.get("tg:session:" + chatId, { type: "json" });
+    } catch (e) {
+        return null;
+    }
+}
+
+async function saveTGSession(env, chatId, session) {
+    if (!env.TOKEN_STORE) return false;
+    try {
+        await env.TOKEN_STORE.put("tg:session:" + chatId, JSON.stringify(session), { expirationTtl: 86400 }); // 24小时过期
+        return true;
+    } catch (e) {
+        console.error("[TG Session Save]", e.message);
+        return false;
+    }
+}
+
+async function deleteTGSession(env, chatId) {
+    if (!env.TOKEN_STORE) return;
+    try {
+        await env.TOKEN_STORE.delete("tg:session:" + chatId);
+    } catch (e) {
+        console.error("[TG Session Delete]", e.message);
+    }
+}
+
+// ================================================================
 // 分布式锁 (KV-based)
 // ================================================================
 
@@ -283,7 +350,7 @@ async function releaseLock(env, lockName) {
 }
 
 // ================================================================
-// Token 刷新逻辑 (v4.0 - 分布式锁版)
+// Token 刷新逻辑 (v4.1)
 // ================================================================
 
 async function refreshTokenWithLock(env, keyData) {
@@ -468,7 +535,6 @@ async function selectKeyWithRefresh(env) {
     var key = await selectKey(env);
     if (key) return key;
 
-    // 没有可用 key，尝试找一个 enabled 但过期的来刷新
     var allKeys = await listAllKeys(env);
     var refreshable = allKeys.filter(function(k) {
         return k.enabled && k.refreshToken;
@@ -614,7 +680,7 @@ function anthropicToOpenaiResp(data, model) {
 }
 
 // ================================================================
-// 构建 Anthropic 请求参数（提前解析，支持重试）
+// 构建 Anthropic 请求参数
 // ================================================================
 
 function buildAnthropicRequest(openaiReq) {
@@ -648,12 +714,10 @@ function buildAnthropicRequest(openaiReq) {
     if (systemPrompt.trim()) anthropicReq.system = systemPrompt.trim();
     if (openaiReq.stream) anthropicReq.stream = true;
 
-    // 传递 thinking 配置
     if (openaiReq.thinking) {
         anthropicReq.thinking = openaiReq.thinking;
     }
 
-    // 传递 tools
     if (openaiReq.tools && Array.isArray(openaiReq.tools)) {
         anthropicReq.tools = openaiReq.tools.map(convertTool);
     }
@@ -705,6 +769,298 @@ async function callAnthropic(accessToken, anthropicReq, timeoutMs) {
 }
 
 // ================================================================
+// 流式处理（支持连接保活，防止断断续续）
+// ================================================================
+
+function handleStream(anthropicResponse, model) {
+    var transformStream = new TransformStream();
+    var writer = transformStream.writable.getWriter();
+    var encoder = new TextEncoder();
+
+    (async function() {
+        var reader = anthropicResponse.body.getReader();
+        var decoder = new TextDecoder();
+        var buffer = "";
+        var chatId = "chatcmpl-" + crypto.randomUUID();
+        var blockTypes = {};
+        var toolCallIndex = -1;
+        var lastSendTime = Date.now();
+        var keepAliveInterval = 20000; // 20秒心跳
+
+        function writeChunk(data) {
+            return writer.write(encoder.encode("data: " + JSON.stringify(data) + "\n\n"));
+        }
+
+        // 发送心跳包，防止连接断开
+        var heartbeatTimer = setInterval(async function() {
+            try {
+                if (Date.now() - lastSendTime > keepAliveInterval) {
+                    await writeChunk({
+                        id: chatId,
+                        object: "chat.completion.chunk",
+                        created: Math.floor(Date.now() / 1000),
+                        model: model,
+                        choices: [{ index: 0, delta: {}, finish_reason: null }]
+                    });
+                    lastSendTime = Date.now();
+                }
+            } catch (e) {
+                clearInterval(heartbeatTimer);
+            }
+        }, keepAliveInterval);
+
+        try {
+            while (true) {
+                var result = await reader.read();
+                if (result.done) break;
+
+                buffer += decoder.decode(result.value, { stream: true });
+                var lines = buffer.split("\n");
+                buffer = lines.pop();
+
+                for (var li = 0; li < lines.length; li++) {
+                    var line = lines[li];
+                    if (!line.startsWith("data: ")) continue;
+                    var dataStr = line.slice(6).trim();
+                    if (!dataStr || dataStr === "[DONE]") continue;
+
+                    try {
+                        var event = JSON.parse(dataStr);
+
+                        if (event.type === "message_start") {
+                            await writeChunk({
+                                id: chatId,
+                                object: "chat.completion.chunk",
+                                created: Math.floor(Date.now() / 1000),
+                                model: model,
+                                choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }]
+                            });
+                            lastSendTime = Date.now();
+
+                        } else if (event.type === "content_block_start") {
+                            var blockIndex = event.index;
+                            var contentBlock = event.content_block;
+
+                            if (contentBlock.type === "tool_use") {
+                                blockTypes[blockIndex] = "tool_use";
+                                toolCallIndex++;
+                                await writeChunk({
+                                    id: chatId,
+                                    object: "chat.completion.chunk",
+                                    created: Math.floor(Date.now() / 1000),
+                                    model: model,
+                                    choices: [{
+                                        index: 0,
+                                        delta: {
+                                            tool_calls: [{
+                                                index: toolCallIndex,
+                                                id: contentBlock.id,
+                                                type: "function",
+                                                function: {
+                                                    name: contentBlock.name,
+                                                    arguments: ""
+                                                }
+                                            }]
+                                        },
+                                        finish_reason: null
+                                    }]
+                                });
+                                lastSendTime = Date.now();
+                            } else if (contentBlock.type === "thinking") {
+                                blockTypes[blockIndex] = "thinking";
+                            } else {
+                                blockTypes[blockIndex] = "text";
+                            }
+
+                        } else if (event.type === "content_block_delta" && event.delta) {
+                            if (event.delta.type === "text_delta") {
+                                await writeChunk({
+                                    id: chatId,
+                                    object: "chat.completion.chunk",
+                                    created: Math.floor(Date.now() / 1000),
+                                    model: model,
+                                    choices: [{ index: 0, delta: { content: event.delta.text }, finish_reason: null }]
+                                });
+                                lastSendTime = Date.now();
+
+                            } else if (event.delta.type === "thinking_delta") {
+                                await writeChunk({
+                                    id: chatId,
+                                    object: "chat.completion.chunk",
+                                    created: Math.floor(Date.now() / 1000),
+                                    model: model,
+                                    choices: [{ index: 0, delta: { reasoning_content: event.delta.thinking }, finish_reason: null }]
+                                });
+                                lastSendTime = Date.now();
+
+                            } else if (event.delta.type === "input_json_delta") {
+                                await writeChunk({
+                                    id: chatId,
+                                    object: "chat.completion.chunk",
+                                    created: Math.floor(Date.now() / 1000),
+                                    model: model,
+                                    choices: [{
+                                        index: 0,
+                                        delta: {
+                                            tool_calls: [{
+                                                index: toolCallIndex,
+                                                function: {
+                                                    arguments: event.delta.partial_json
+                                                }
+                                            }]
+                                        },
+                                        finish_reason: null
+                                    }]
+                                });
+                                lastSendTime = Date.now();
+                            }
+
+                        } else if (event.type === "message_delta") {
+                            var finishReason = mapStopReason(event.delta && event.delta.stop_reason);
+                            await writeChunk({
+                                id: chatId,
+                                object: "chat.completion.chunk",
+                                created: Math.floor(Date.now() / 1000),
+                                model: model,
+                                choices: [{ index: 0, delta: {}, finish_reason: finishReason }]
+                            });
+                            lastSendTime = Date.now();
+
+                        } else if (event.type === "message_stop") {
+                            await writer.write(encoder.encode("data: [DONE]\n\n"));
+                            lastSendTime = Date.now();
+                        }
+
+                    } catch (e) {
+                        console.error("[Stream Parse]", e.message);
+                    }
+                }
+            }
+        } catch (err) {
+            console.error("[Stream] Error:", err.message);
+        } finally {
+            clearInterval(heartbeatTimer);
+            try { await writer.close(); } catch (e) {}
+        }
+    })();
+
+    return new Response(transformStream.readable, {
+        headers: {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "Access-Control-Allow-Origin": "*",
+            "X-Accel-Buffering": "no"  // 禁用代理缓冲
+        }
+    });
+}
+
+// ================================================================
+// Telegram 直接对话功能
+// ================================================================
+
+async function handleTGChat(env, chatId, userId, userMessage, replyToMessageId) {
+    // 获取或创建会话
+    var session = await getTGSession(env, chatId);
+    if (!session) {
+        session = {
+            messages: [],
+            model: "claude-sonnet-4-5",
+            createdAt: new Date().toISOString()
+        };
+    }
+
+    // 添加用户消息到会话历史
+    session.messages.push({
+        role: "user",
+        content: userMessage
+    });
+
+    // 限制会话长度（防止太长）
+    if (session.messages.length > 20) {
+        session.messages = session.messages.slice(-20);
+    }
+
+    // 发送"正在思考..."消息
+    var thinkingMsg = await sendTGReply(env, chatId, "🤔 正在思考...", replyToMessageId);
+
+    try {
+        // 选择 Key
+        var selectedKey = await selectKeyWithRefresh(env);
+        if (!selectedKey) {
+            await editTGMessage(env, chatId, thinkingMsg.messageId, "❌ 没有可用的 API Key");
+            return;
+        }
+
+        // 构建请求
+        var openaiReq = {
+            messages: session.messages,
+            model: session.model,
+            max_tokens: 2048,
+            stream: false
+        };
+
+        var built = buildAnthropicRequest(openaiReq);
+        var result = await callAnthropic(selectedKey.accessToken, built.anthropicReq, 120000);
+
+        if (result.error) {
+            await recordKeyUsage(env, selectedKey, false);
+            await editTGMessage(env, chatId, thinkingMsg.messageId, "❌ 请求失败: " + escHtml(result.error));
+            return;
+        }
+
+        var response = result.response;
+        if (!response.ok) {
+            var errorText = await response.text();
+            await recordKeyUsage(env, selectedKey, false);
+            await editTGMessage(env, chatId, thinkingMsg.messageId, "❌ API 错误: " + escHtml(errorText.substring(0, 200)));
+            return;
+        }
+
+        var data = await response.json();
+        await recordKeyUsage(env, selectedKey, true);
+
+        // 提取回复
+        var respObj = anthropicToOpenaiResp(data, session.model);
+        var assistantMessage = (respObj.choices && respObj.choices[0] && respObj.choices[0].message && respObj.choices[0].message.content) || "(无回复)";
+
+        // 保存到会话历史
+        session.messages.push({
+            role: "assistant",
+            content: assistantMessage
+        });
+
+        await saveTGSession(env, chatId, session);
+
+        // 分割长消息（Telegram 最多 4096 字）
+        var MAX_TG_MSG = 4000;
+        if (assistantMessage.length <= MAX_TG_MSG) {
+            await editTGMessage(env, chatId, thinkingMsg.messageId, assistantMessage);
+        } else {
+            // 第一条编辑原消息
+            await editTGMessage(env, chatId, thinkingMsg.messageId, assistantMessage.substring(0, MAX_TG_MSG));
+            
+            // 后续消息作为新回复
+            var remaining = assistantMessage.substring(MAX_TG_MSG);
+            var partNum = 2;
+            while (remaining.length > 0) {
+                var chunk = remaining.substring(0, MAX_TG_MSG);
+                remaining = remaining.substring(MAX_TG_MSG);
+                
+                var header = "📄 续 (" + partNum + ")\n\n";
+                await sendTGReply(env, chatId, header + chunk, replyToMessageId);
+                await sleep(300);
+                partNum++;
+            }
+        }
+
+    } catch (err) {
+        console.error("[TG Chat]", err.message);
+        await editTGMessage(env, chatId, thinkingMsg.messageId, "❌ 处理出错: " + escHtml(err.message));
+    }
+}
+
+// ================================================================
 // Telegram Webhook 处理
 // ================================================================
 
@@ -742,11 +1098,20 @@ async function handleTelegramWebhook(request, env) {
 
     var msg = update.message;
     var chatId = String(msg.chat.id);
+    var userId = String(msg.from.id);
     var allowedChatId = String(env.TELEGRAM_CHAT_ID || "");
     var text = (msg.text || "").trim();
 
-    if (chatId !== allowedChatId) return new Response("OK");
-    if (!text.startsWith("/")) return new Response("OK");
+    // 管理命令只允许在指定群/用户
+    if (text.startsWith("/") && chatId !== allowedChatId) {
+        return new Response("OK");
+    }
+
+    // 非命令消息作为 AI 对话
+    if (!text.startsWith("/")) {
+        await handleTGChat(env, chatId, userId, text, msg.message_id);
+        return new Response("OK");
+    }
 
     var parts = text.split(/\s+/);
     var cmd = parts[0].toLowerCase().split("@")[0];
@@ -756,7 +1121,11 @@ async function handleTelegramWebhook(request, env) {
         switch (cmd) {
             case "/help":
                 await sendTG(env,
-                    "🤖 <b>Claude 代理管理 Bot v4.0</b>\n\n" +
+                    "🤖 <b>Claude 代理管理 Bot v4.1</b>\n\n" +
+                    "<b>直接对话：</b>\n" +
+                    "直接发送文字消息即可与 Claude 对话\n" +
+                    "/clear — 清空对话历史\n\n" +
+                    "<b>Key 管理：</b>\n" +
                     "/addkey &lt;label&gt; &lt;JSON&gt; — 添加 Key\n" +
                     "/removekey &lt;label&gt; — 删除 Key\n" +
                     "/listkeys — 列出所有 Key\n" +
@@ -766,6 +1135,11 @@ async function handleTelegramWebhook(request, env) {
                     "/refresh &lt;label&gt; — 刷新指定 Key\n" +
                     "/refreshall — 刷新所有\n"
                 );
+                break;
+
+            case "/clear":
+                await deleteTGSession(env, chatId);
+                await sendTG(env, "✅ 已清空对话历史");
                 break;
 
             case "/addkey":
@@ -804,8 +1178,6 @@ async function handleTelegramWebhook(request, env) {
                 };
 
                 await saveKey(env, addLabel, addKeyData);
-
-                // 删除包含敏感信息的原消息
                 await deleteTGMessage(env, chatId, msg.message_id);
 
                 await sendTG(env,
@@ -947,6 +1319,7 @@ async function handleTelegramWebhook(request, env) {
                 await sendTG(env, "❓ 未知命令，输入 /help 查看帮助");
         }
     } catch (err) {
+        console.error("[TG Command]", err.message);
         await sendTG(env, "❌ 执行出错: " + escHtml(err.message));
     }
     return new Response("OK");
@@ -962,13 +1335,11 @@ async function handleChatCompletions(request, env) {
         return errorResponse("Invalid API key", 401);
     }
 
-    // 提前解析请求体（只读一次，支持重试）
     var openaiReq = await request.json().catch(function() { return {}; });
     var built = buildAnthropicRequest(openaiReq);
     var anthropicReq = built.anthropicReq;
     var requestedModel = built.requestedModel;
 
-    // 动态超时：有 thinking 配置的给更长时间
     var timeoutMs = (openaiReq.thinking || anthropicReq.thinking) ? 300000 : 120000;
 
     var MAX_RETRIES = 2;
@@ -1004,21 +1375,17 @@ async function handleChatCompletions(request, env) {
             }
         }
 
-        // 处理错误响应
         var errorBody = await response.text().catch(function() { return "Unknown error"; });
         await recordKeyUsage(env, selectedKey, false);
 
         if (response.status === 401 || response.status === 403) {
-            // Token 失效，尝试刷新
             await sendTG(env, "⚠️ <b>Key 请求失败 (" + response.status + ")</b>\n📛 " + escHtml(keyLabel) + "\n尝试自动刷新...");
 
             var refreshResult = await refreshTokenWithLock(env, selectedKey);
             if (refreshResult.success) {
                 await sendTG(env, "✅ 刷新成功，正在重试请求...");
-                // 下一轮循环会重新 selectKey
                 continue;
             } else {
-                // 刷新失败，标记过期
                 selectedKey.expiresAt = 0;
                 await saveKey(env, selectedKey.label, selectedKey);
                 await sendTG(env, "❌ 刷新失败: " + escHtml(refreshResult.error) + "\n已标记为过期，尝试其他 Key...");
@@ -1027,183 +1394,20 @@ async function handleChatCompletions(request, env) {
         }
 
         if (response.status === 429 || response.status >= 500) {
-            // 速率限制或服务器错误，换个 key 重试
             lastErrorBody = errorBody;
             lastErrorStatus = response.status;
             continue;
         }
 
-        // 其他客户端错误（400等），直接返回不重试
         return new Response(errorBody, {
             status: response.status,
             headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
         });
     }
 
-    // 所有重试都失败
     return new Response(lastErrorBody || JSON.stringify({ error: { message: "All retries failed", type: "api_error" } }), {
         status: lastErrorStatus,
         headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
-    });
-}
-
-// ================================================================
-// 流式处理（支持 thinking + tool_calls）
-// ================================================================
-
-function handleStream(anthropicResponse, model) {
-    var transformStream = new TransformStream();
-    var writer = transformStream.writable.getWriter();
-    var encoder = new TextEncoder();
-
-    (async function() {
-        var reader = anthropicResponse.body.getReader();
-        var decoder = new TextDecoder();
-        var buffer = "";
-        var chatId = "chatcmpl-" + crypto.randomUUID();
-
-        // 跟踪 content blocks 的类型
-        var blockTypes = {};
-        var toolCallIndex = -1;
-
-        function writeChunk(data) {
-            return writer.write(encoder.encode("data: " + JSON.stringify(data) + "\n\n"));
-        }
-
-        try {
-            while (true) {
-                var result = await reader.read();
-                if (result.done) break;
-
-                buffer += decoder.decode(result.value, { stream: true });
-                var lines = buffer.split("\n");
-                buffer = lines.pop();
-
-                for (var li = 0; li < lines.length; li++) {
-                    var line = lines[li];
-                    if (!line.startsWith("data: ")) continue;
-                    var dataStr = line.slice(6).trim();
-                    if (!dataStr || dataStr === "[DONE]") continue;
-
-                    try {
-                        var event = JSON.parse(dataStr);
-
-                        if (event.type === "message_start") {
-                            await writeChunk({
-                                id: chatId,
-                                object: "chat.completion.chunk",
-                                created: Math.floor(Date.now() / 1000),
-                                model: model,
-                                choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }]
-                            });
-
-                        } else if (event.type === "content_block_start") {
-                            var blockIndex = event.index;
-                            var contentBlock = event.content_block;
-
-                            if (contentBlock.type === "tool_use") {
-                                blockTypes[blockIndex] = "tool_use";
-                                toolCallIndex++;
-                                await writeChunk({
-                                    id: chatId,
-                                    object: "chat.completion.chunk",
-                                    created: Math.floor(Date.now() / 1000),
-                                    model: model,
-                                    choices: [{
-                                        index: 0,
-                                        delta: {
-                                            tool_calls: [{
-                                                index: toolCallIndex,
-                                                id: contentBlock.id,
-                                                type: "function",
-                                                function: {
-                                                    name: contentBlock.name,
-                                                    arguments: ""
-                                                }
-                                            }]
-                                        },
-                                        finish_reason: null
-                                    }]
-                                });
-                            } else if (contentBlock.type === "thinking") {
-                                blockTypes[blockIndex] = "thinking";
-                            } else {
-                                blockTypes[blockIndex] = "text";
-                            }
-
-                        } else if (event.type === "content_block_delta" && event.delta) {
-                            if (event.delta.type === "text_delta") {
-                                await writeChunk({
-                                    id: chatId,
-                                    object: "chat.completion.chunk",
-                                    created: Math.floor(Date.now() / 1000),
-                                    model: model,
-                                    choices: [{ index: 0, delta: { content: event.delta.text }, finish_reason: null }]
-                                });
-
-                            } else if (event.delta.type === "thinking_delta") {
-                                await writeChunk({
-                                    id: chatId,
-                                    object: "chat.completion.chunk",
-                                    created: Math.floor(Date.now() / 1000),
-                                    model: model,
-                                    choices: [{ index: 0, delta: { reasoning_content: event.delta.thinking }, finish_reason: null }]
-                                });
-
-                            } else if (event.delta.type === "input_json_delta") {
-                                await writeChunk({
-                                    id: chatId,
-                                    object: "chat.completion.chunk",
-                                    created: Math.floor(Date.now() / 1000),
-                                    model: model,
-                                    choices: [{
-                                        index: 0,
-                                        delta: {
-                                            tool_calls: [{
-                                                index: toolCallIndex,
-                                                function: {
-                                                    arguments: event.delta.partial_json
-                                                }
-                                            }]
-                                        },
-                                        finish_reason: null
-                                    }]
-                                });
-                            }
-
-                        } else if (event.type === "message_delta") {
-                            var finishReason = mapStopReason(event.delta && event.delta.stop_reason);
-                            await writeChunk({
-                                id: chatId,
-                                object: "chat.completion.chunk",
-                                created: Math.floor(Date.now() / 1000),
-                                model: model,
-                                choices: [{ index: 0, delta: {}, finish_reason: finishReason }]
-                            });
-
-                        } else if (event.type === "message_stop") {
-                            await writer.write(encoder.encode("data: [DONE]\n\n"));
-                        }
-
-                    } catch (e) {
-                        // 解析单行 SSE 失败，跳过
-                    }
-                }
-            }
-        } catch (err) {
-            console.error("[Stream] Error:", err.message);
-        } finally {
-            try { await writer.close(); } catch (e) {}
-        }
-    })();
-
-    return new Response(transformStream.readable, {
-        headers: {
-            "Content-Type": "text/event-stream",
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "Access-Control-Allow-Origin": "*"
-        }
     });
 }
 
@@ -1227,17 +1431,14 @@ export default {
         var url = new URL(request.url);
 
         try {
-            // Telegram Webhook
             if (url.pathname === "/telegram/webhook" && request.method === "POST") {
                 return await handleTelegramWebhook(request, env);
             }
 
-            // 设置 Webhook
             if (url.pathname === "/telegram/setup" && request.method === "GET") {
                 return await setupTelegramWebhook(url, env);
             }
 
-            // OpenAI 兼容：模型列表
             if (url.pathname === "/v1/models" && request.method === "GET") {
                 return corsResponse(JSON.stringify({
                     object: "list",
@@ -1245,7 +1446,6 @@ export default {
                 }));
             }
 
-            // OpenAI 兼容：聊天补全
             if (url.pathname === "/v1/chat/completions" && request.method === "POST") {
                 return await handleChatCompletions(request, env);
             }
