@@ -1,43 +1,101 @@
 // ================================================================
-// Claude API 代理 v4.1 (完整版)
+// Claude API 代理 v4.2 (终极版)
 // 功能：自定义Token鉴权 / Telegram Bot管理 / 多Key负载均衡 / 自动刷新
 //       分布式锁 / 自动重试 / 流式thinking+tool_calls / 安全加固
-//       Telegram 直接对话 / 会话管理 / 连接保活
+//       Telegram 直接对话 / 会话管理 / 连接保活 / 动态长上下文支持
 // ================================================================
 
 const MODEL_MAP = {
+  /* Claude 4.6 */
   "claude-opus-4-6": "claude-opus-4-6",
   "claude-opus-4-6-latest": "claude-opus-4-6",
+  "claude-sonnet-4-6": "claude-sonnet-4-6",
+  "claude-sonnet-4-6-latest": "claude-sonnet-4-6",
+
+  /* Claude 4.5 */
   "claude-sonnet-4-5": "claude-sonnet-4-5-20250929",
   "claude-sonnet-4-5-20250929": "claude-sonnet-4-5-20250929",
   "claude-haiku-4-5": "claude-haiku-4-5-20251001",
   "claude-haiku-4-5-20251001": "claude-haiku-4-5-20251001",
   "claude-opus-4-5": "claude-opus-4-5-20251101",
   "claude-opus-4-5-20251101": "claude-opus-4-5-20251101",
+
+  /* Claude 4.x 旧版 */
   "claude-opus-4-1": "claude-opus-4-1-20250805",
   "claude-opus-4-1-20250805": "claude-opus-4-1-20250805",
   "claude-opus-4-0": "claude-opus-4-20250514",
   "claude-opus-4-20250514": "claude-opus-4-20250514",
   "claude-sonnet-4-0": "claude-sonnet-4-20250514",
   "claude-sonnet-4-20250514": "claude-sonnet-4-20250514",
+
+  /* Claude 3.7 */
   "claude-3-7-sonnet": "claude-3-7-sonnet-20250219",
   "claude-3-7-sonnet-latest": "claude-3-7-sonnet-20250219",
   "claude-3-7-sonnet-20250219": "claude-3-7-sonnet-20250219",
+
+  /* Claude 3.5 */
   "claude-3-5-sonnet": "claude-3-5-sonnet-20241022",
   "claude-3-5-sonnet-20241022": "claude-3-5-sonnet-20241022",
+  "claude-3-5-sonnet-20240620": "claude-3-5-sonnet-20240620",
   "claude-3-5-haiku": "claude-3-5-haiku-20241022",
   "claude-3-5-haiku-20241022": "claude-3-5-haiku-20241022",
+
+  /* Claude 3 */
   "claude-3-opus": "claude-3-opus-20240229",
   "claude-3-opus-20240229": "claude-3-opus-20240229",
+  "claude-3-sonnet": "claude-3-sonnet-20240229",
+  "claude-3-sonnet-20240229": "claude-3-sonnet-20240229",
   "claude-3-haiku": "claude-3-haiku-20240307",
   "claude-3-haiku-20240307": "claude-3-haiku-20240307",
-  "claude-2.1": "claude-2-1",
-  "claude-2-1": "claude-2-1",
-  "claude-2.0": "claude-2-0",
-  "claude-2-0": "claude-2-0",
-  "claude-instant-1.2": "claude-instant-1-2",
-  "claude-instant-1-2": "claude-instant-1-2"
+
+  /* Claude 2.x */
+  "claude-2.1": "claude-2.1",
+  "claude-2.0": "claude-2.0",
+
+  /* Claude Instant */
+  "claude-instant-1.2": "claude-instant-1.2",
+  "claude-instant-1.1": "claude-instant-1.1"
 };
+
+var MODEL_MAX_OUTPUT = {
+    "claude-opus-4-6":             128000,
+    "claude-opus-4-5-20251101":    32768,
+    "claude-opus-4-1-20250805":    32768,
+    "claude-opus-4-20250514":      32768,
+    "claude-sonnet-4-6":           65536,
+    "claude-sonnet-4-5-20250929":  65536,
+    "claude-sonnet-4-20250514":    16384,
+    "claude-haiku-4-5-20251001":   16384,
+    "claude-3-7-sonnet-20250219":  8192,
+    "claude-3-5-sonnet-20241022":  8192,
+    "claude-3-5-sonnet-20240620":  8192,
+    "claude-3-5-haiku-20241022":   8192,
+    "claude-3-opus-20240229":      4096,
+    "claude-3-sonnet-20240229":    4096,
+    "claude-3-haiku-20240307":     4096,
+    "claude-2.1":                  4096,
+    "claude-2.0":                  4096,
+    "claude-instant-1.2":          4096,
+    "claude-instant-1.1":          4096
+};
+
+var MODEL_MAX_OUTPUT_THINKING = {
+    "claude-opus-4-6":             128000,
+    "claude-opus-4-5-20251101":    64000,
+    "claude-opus-4-1-20250805":    64000,
+    "claude-opus-4-20250514":      64000,
+    "claude-sonnet-4-6":           65536,
+    "claude-sonnet-4-5-20250929":  65536,
+    "claude-sonnet-4-20250514":    65536,
+    "claude-3-7-sonnet-20250219":  128000
+};
+
+function getModelMaxTokens(model, hasThinking) {
+    if (hasThinking && MODEL_MAX_OUTPUT_THINKING[model]) {
+        return MODEL_MAX_OUTPUT_THINKING[model];
+    }
+    return MODEL_MAX_OUTPUT[model] ?? 32768;
+}
 
 var SUPPORTED_MODELS = Object.keys(MODEL_MAP).map(function(id) {
     return { id: id, object: "model", created: 0, owned_by: "anthropic" };
@@ -350,7 +408,7 @@ async function releaseLock(env, lockName) {
 }
 
 // ================================================================
-// Token 刷新逻辑 (v4.1)
+// Token 刷新逻辑
 // ================================================================
 
 async function refreshTokenWithLock(env, keyData) {
@@ -705,46 +763,79 @@ function buildAnthropicRequest(openaiReq) {
     var requestedModel = openaiReq.model || "claude-sonnet-4-5";
     var model = MODEL_MAP[requestedModel] || MODEL_MAP["claude-sonnet-4-5"];
 
+    var hasThinking = false;
+    var thinkingConfig = null;
+
+    if (openaiReq.thinking) {
+        hasThinking = true;
+        if (typeof openaiReq.thinking === "object") {
+            thinkingConfig = openaiReq.thinking;
+        } else {
+            thinkingConfig = { type: "enabled", budget_tokens: 10000 };
+        }
+    } else if (openaiReq.model && openaiReq.model.includes("opus") && openaiReq.thinking !== false) {
+        hasThinking = true;
+        thinkingConfig = { type: "enabled", budget_tokens: 5000 };
+    }
+
+    var modelMax = getModelMaxTokens(model, hasThinking);
+    var clientMax = openaiReq.max_tokens || openaiReq.max_completion_tokens || 0;
+
+    var finalMaxTokens;
+    if (clientMax > 0) {
+        finalMaxTokens = Math.min(clientMax, modelMax);
+    } else {
+        finalMaxTokens = modelMax;
+    }
+
     var anthropicReq = {
         model: model,
-        max_tokens: openaiReq.max_tokens || 8192,
+        max_tokens: finalMaxTokens,
         messages: anthropicMessages
     };
 
     if (systemPrompt.trim()) anthropicReq.system = systemPrompt.trim();
     if (openaiReq.stream) anthropicReq.stream = true;
 
-    // ✅ 修复：正确处理 thinking 配置
-    if (openaiReq.thinking) {
-        // 如果客户端传了 thinking 配置，直接用
-        anthropicReq.thinking = openaiReq.thinking;
-    } else if (openaiReq.model && openaiReq.model.includes("opus")) {
-        // opus 系列模型自动启用 thinking（如果没显式禁用）
-        // 检查 openaiReq 中是否明确设置为 disabled
-        if (openaiReq.thinking !== false) {
-            anthropicReq.thinking = {
-                type: "enabled",
-                budget_tokens: 5000  // 默认预算
-            };
+    if (hasThinking && thinkingConfig) {
+        if (thinkingConfig.budget_tokens && thinkingConfig.budget_tokens >= finalMaxTokens) {
+            thinkingConfig.budget_tokens = Math.floor(finalMaxTokens * 0.75);
         }
+        anthropicReq.thinking = thinkingConfig;
     }
 
     if (openaiReq.tools && Array.isArray(openaiReq.tools)) {
         anthropicReq.tools = openaiReq.tools.map(convertTool);
     }
 
-    return { anthropicReq: anthropicReq, requestedModel: requestedModel };
+    if (hasThinking) {
+        anthropicReq.temperature = 1;
+    } else if (openaiReq.temperature !== undefined) {
+        anthropicReq.temperature = openaiReq.temperature;
+    }
+
+    if (openaiReq.top_p !== undefined && !hasThinking) {
+        anthropicReq.top_p = openaiReq.top_p;
+    }
+
+    console.log("[Build] Model:", model, "MaxTokens:", finalMaxTokens, "Thinking:", hasThinking);
+
+    return { anthropicReq: anthropicReq, requestedModel: requestedModel, hasThinking: hasThinking };
 }
 
-
-function buildAnthropicHeaders(accessToken) {
+function buildAnthropicHeaders(accessToken, hasThinking) {
     var headers = {
         "anthropic-version": "2023-06-01",
         "Content-Type": "application/json",
-        "anthropic-beta": "oauth-2025-04-20",
         "x-app": "cli",
         "User-Agent": "claude-code/2.0.62"
     };
+
+    var betaFeatures = ["oauth-2025-04-20"];
+    if (hasThinking) {
+        betaFeatures.push("interleaved-thinking-2025-05-14");
+    }
+    headers["anthropic-beta"] = betaFeatures.join(",");
 
     if (accessToken.startsWith("sk-ant-oat")) {
         headers["Authorization"] = "Bearer " + accessToken;
@@ -759,8 +850,8 @@ function buildAnthropicHeaders(accessToken) {
 // 调用 Anthropic API（单次）
 // ================================================================
 
-async function callAnthropic(accessToken, anthropicReq, timeoutMs) {
-    var headers = buildAnthropicHeaders(accessToken);
+async function callAnthropic(accessToken, anthropicReq, timeoutMs, hasThinking) {
+    var headers = buildAnthropicHeaders(accessToken, hasThinking);
     var controller = new AbortController();
     var timeoutId = setTimeout(function() { controller.abort(); }, timeoutMs || 120000);
 
@@ -781,12 +872,12 @@ async function callAnthropic(accessToken, anthropicReq, timeoutMs) {
 }
 
 // ================================================================
-// 流式处理（支持连接保活，防止断断续续）
+// 流式处理（防断连优化版）
 // ================================================================
 
 function handleStream(anthropicResponse, model) {
     var transformStream = new TransformStream({
-        highWaterMark: 1024 * 64, // 64KB 缓冲（足够大但不会爆）
+        highWaterMark: 1024 * 64, // 64KB 缓冲
     });
     var writer = transformStream.writable.getWriter();
     var encoder = new TextEncoder();
@@ -799,7 +890,7 @@ function handleStream(anthropicResponse, model) {
         var blockTypes = {};
         var toolCallIndex = -1;
         var lastSendTime = Date.now();
-        var keepAliveInterval = 10000; // 10秒心跳（更频繁）
+        var keepAliveInterval = 10000; // 10秒心跳
         var chunkCount = 0;
         var totalTokensProcessed = 0;
 
@@ -807,7 +898,6 @@ function handleStream(anthropicResponse, model) {
             return writer.write(encoder.encode("data: " + JSON.stringify(data) + "\n\n"));
         }
 
-        // 心跳保活（更激进）
         var heartbeatTimer = setInterval(async function() {
             try {
                 if (Date.now() - lastSendTime > keepAliveInterval) {
@@ -834,13 +924,11 @@ function handleStream(anthropicResponse, model) {
                     break;
                 }
 
-                // 逐步处理数据，防止缓冲过载
                 var chunk = result.value;
                 buffer += decoder.decode(chunk, { stream: true });
 
-                // 分行处理，每行立即处理不积压
                 var lines = buffer.split("\n");
-                buffer = lines.pop(); // 保留未完成的行
+                buffer = lines.pop(); 
 
                 for (var li = 0; li < lines.length; li++) {
                     var line = lines[li];
@@ -907,7 +995,6 @@ function handleStream(anthropicResponse, model) {
 
                             } else if (contentBlock.type === "thinking") {
                                 blockTypes[blockIndex] = "thinking";
-                                // ✅ 通知开始思考
                                 await writeChunk({
                                     id: chatId,
                                     object: "chat.completion.chunk",
@@ -939,7 +1026,6 @@ function handleStream(anthropicResponse, model) {
                                 chunkCount++;
 
                             } else if (event.delta.type === "thinking_delta") {
-                                // ✅ 正确转发思考过程
                                 await writeChunk({
                                     id: chatId,
                                     object: "chat.completion.chunk",
@@ -979,7 +1065,6 @@ function handleStream(anthropicResponse, model) {
                             }
 
                         } else if (event.type === "content_block_stop") {
-                            // ✅ 块结束时记录
                             if (blockTypes[event.index] === "thinking") {
                                 await writeChunk({
                                     id: chatId,
@@ -1008,7 +1093,6 @@ function handleStream(anthropicResponse, model) {
                             lastSendTime = Date.now();
                             chunkCount++;
 
-                            // 记录 token 统计
                             if (event.usage) {
                                 totalTokensProcessed = event.usage.input_tokens + event.usage.output_tokens;
                                 console.log("[Stream] Total tokens:", totalTokensProcessed);
@@ -1025,14 +1109,11 @@ function handleStream(anthropicResponse, model) {
                     }
                 }
 
-                // ✅ 主动刷新缓冲（高频率）
                 if (chunkCount % 10 === 0) {
-                    // 每10个chunk刷新一次日志
                     console.log("[Stream] Processed", chunkCount, "chunks, elapsed:", Date.now() - lastSendTime, "ms");
                 }
             }
 
-            // 处理残留的缓冲区
             if (buffer.trim()) {
                 var lastLine = buffer.trim();
                 if (lastLine.startsWith("data: ")) {
@@ -1041,7 +1122,6 @@ function handleStream(anthropicResponse, model) {
                         try {
                             var lastEvent = JSON.parse(lastDataStr);
                             console.log("[Stream] Processing final buffer:", lastEvent.type);
-                            // 处理最后一行...
                         } catch (e) {}
                     }
                 }
@@ -1072,18 +1152,16 @@ function handleStream(anthropicResponse, model) {
             "Connection": "keep-alive",
             "Access-Control-Allow-Origin": "*",
             "X-Accel-Buffering": "no",
-            "Transfer-Encoding": "chunked"  // ✅ 显式声明分块编码
+            "Transfer-Encoding": "chunked"
         }
     });
 }
-
 
 // ================================================================
 // Telegram 直接对话功能
 // ================================================================
 
 async function handleTGChat(env, chatId, userId, userMessage, replyToMessageId) {
-    // 获取或创建会话
     var session = await getTGSession(env, chatId);
     if (!session) {
         session = {
@@ -1093,38 +1171,33 @@ async function handleTGChat(env, chatId, userId, userMessage, replyToMessageId) 
         };
     }
 
-    // 添加用户消息到会话历史
     session.messages.push({
         role: "user",
         content: userMessage
     });
 
-    // 限制会话长度（防止太长）
     if (session.messages.length > 20) {
         session.messages = session.messages.slice(-20);
     }
 
-    // 发送"正在思考..."消息
     var thinkingMsg = await sendTGReply(env, chatId, "🤔 正在思考...", replyToMessageId);
 
     try {
-        // 选择 Key
         var selectedKey = await selectKeyWithRefresh(env);
         if (!selectedKey) {
             await editTGMessage(env, chatId, thinkingMsg.messageId, "❌ 没有可用的 API Key");
             return;
         }
 
-        // 构建请求
         var openaiReq = {
             messages: session.messages,
             model: session.model,
-            max_tokens: 2048,
+            max_tokens: 4096,
             stream: false
         };
 
         var built = buildAnthropicRequest(openaiReq);
-        var result = await callAnthropic(selectedKey.accessToken, built.anthropicReq, 120000);
+        var result = await callAnthropic(selectedKey.accessToken, built.anthropicReq, 180000, built.hasThinking);
 
         if (result.error) {
             await recordKeyUsage(env, selectedKey, false);
@@ -1143,11 +1216,9 @@ async function handleTGChat(env, chatId, userId, userMessage, replyToMessageId) 
         var data = await response.json();
         await recordKeyUsage(env, selectedKey, true);
 
-        // 提取回复
         var respObj = anthropicToOpenaiResp(data, session.model);
         var assistantMessage = (respObj.choices && respObj.choices[0] && respObj.choices[0].message && respObj.choices[0].message.content) || "(无回复)";
 
-        // 保存到会话历史
         session.messages.push({
             role: "assistant",
             content: assistantMessage
@@ -1155,15 +1226,12 @@ async function handleTGChat(env, chatId, userId, userMessage, replyToMessageId) 
 
         await saveTGSession(env, chatId, session);
 
-        // 分割长消息（Telegram 最多 4096 字）
         var MAX_TG_MSG = 4000;
         if (assistantMessage.length <= MAX_TG_MSG) {
             await editTGMessage(env, chatId, thinkingMsg.messageId, assistantMessage);
         } else {
-            // 第一条编辑原消息
             await editTGMessage(env, chatId, thinkingMsg.messageId, assistantMessage.substring(0, MAX_TG_MSG));
             
-            // 后续消息作为新回复
             var remaining = assistantMessage.substring(MAX_TG_MSG);
             var partNum = 2;
             while (remaining.length > 0) {
@@ -1207,7 +1275,6 @@ async function setupTelegramWebhook(url, env) {
 }
 
 async function handleTelegramWebhook(request, env) {
-    // 验证 Telegram Webhook Secret
     if (env.TELEGRAM_WEBHOOK_SECRET) {
         var secretHeader = request.headers.get("X-Telegram-Bot-Api-Secret-Token") || "";
         if (secretHeader !== env.TELEGRAM_WEBHOOK_SECRET) {
@@ -1225,12 +1292,10 @@ async function handleTelegramWebhook(request, env) {
     var allowedChatId = String(env.TELEGRAM_CHAT_ID || "");
     var text = (msg.text || "").trim();
 
-    // 管理命令只允许在指定群/用户
     if (text.startsWith("/") && chatId !== allowedChatId) {
         return new Response("OK");
     }
 
-    // 非命令消息作为 AI 对话
     if (!text.startsWith("/")) {
         await handleTGChat(env, chatId, userId, text, msg.message_id);
         return new Response("OK");
@@ -1244,7 +1309,7 @@ async function handleTelegramWebhook(request, env) {
         switch (cmd) {
             case "/help":
                 await sendTG(env,
-                    "🤖 <b>Claude 代理管理 Bot v4.1</b>\n\n" +
+                    "🤖 <b>Claude 代理管理 Bot v4.2</b>\n\n" +
                     "<b>直接对话：</b>\n" +
                     "直接发送文字消息即可与 Claude 对话\n" +
                     "/clear — 清空对话历史\n\n" +
@@ -1462,21 +1527,20 @@ async function handleChatCompletions(request, env) {
     var built = buildAnthropicRequest(openaiReq);
     var anthropicReq = built.anthropicReq;
     var requestedModel = built.requestedModel;
+    var hasThinking = built.hasThinking;
 
-    var estimatedTokens = JSON.stringify(anthropicReq).length / 4;
-    var timeoutMs = 120000; // 基础 2 分钟
+    var estimatedOutputTokens = anthropicReq.max_tokens || 8192;
+    var timeoutMs = 120000;
 
-    if (openaiReq.thinking) {
-        timeoutMs = Math.max(300000, 120000 + (estimatedTokens * 100)); // 5分钟起步
-    } else if (estimatedTokens > 50000) {
-        timeoutMs = 300000; // 50k+ token 给 5 分钟
-    } else if (estimatedTokens > 10000) {
-        timeoutMs = 180000; // 10k+ token 给 3 分钟
+    if (hasThinking) {
+        timeoutMs = 600000;
+    } else if (estimatedOutputTokens > 32000) {
+        timeoutMs = 300000;
+    } else if (estimatedOutputTokens > 16000) {
+        timeoutMs = 240000;
     }
 
-    console.log("[API] Timeout set to", timeoutMs, "ms for estimated", estimatedTokens, "tokens");
-
- 
+    console.log("[API] MaxTokens:", estimatedOutputTokens, "Timeout:", timeoutMs, "ms, Thinking:", hasThinking);
 
     var MAX_RETRIES = 2;
     var lastErrorBody = "";
@@ -1489,7 +1553,7 @@ async function handleChatCompletions(request, env) {
         }
 
         var keyLabel = selectedKey.label;
-        var result = await callAnthropic(selectedKey.accessToken, anthropicReq, timeoutMs);
+        var result = await callAnthropic(selectedKey.accessToken, anthropicReq, timeoutMs, hasThinking);
 
         if (result.error) {
             await recordKeyUsage(env, selectedKey, false);
